@@ -50,6 +50,14 @@ async def _run(args: argparse.Namespace) -> int:
         allow_private_networks=args.allow_private_networks,
         proxy_urls=tuple(args.proxy),
         proxy_mode=ProxyMode(args.proxy_mode),
+        browser_enabled=args.browser,
+        browser_type=args.browser_type,
+        browser_executable_path=(
+            Path(args.browser_executable) if args.browser_executable else None
+        ),
+        browser_max_concurrency=args.browser_concurrency,
+        browser_navigation_timeout_seconds=args.browser_timeout,
+        browser_settle_seconds=args.browser_settle_ms / 1000,
         output=Path(args.output) if args.output else None,
     )
     crawler = LocalCrawler(config)
@@ -83,6 +91,24 @@ def _add_common_flags(parser: argparse.ArgumentParser, *, default_pages: int) ->
         default=ProxyMode.AUTO.value,
         help="auto learns direct/proxy preference; direct/required are hard overrides",
     )
+    parser.add_argument(
+        "--browser",
+        action="store_true",
+        help="allow evidence-driven Playwright rendering escalation",
+    )
+    parser.add_argument(
+        "--browser-type",
+        choices=["chromium", "chrome", "firefox", "webkit"],
+        default="chromium",
+    )
+    parser.add_argument(
+        "--browser-executable",
+        metavar="PATH",
+        help="optional browser executable path",
+    )
+    parser.add_argument("--browser-concurrency", type=int, default=2)
+    parser.add_argument("--browser-timeout", type=float, default=45.0)
+    parser.add_argument("--browser-settle-ms", type=float, default=250.0)
     parser.add_argument(
         "--ignore-robots",
         action="store_true",
