@@ -6,8 +6,12 @@ from urllib.parse import urljoin
 
 from syndcrawler.config import CrawlConfig
 from syndcrawler.core.egress import EgressPolicy, UnsafeTargetError
-from syndcrawler.core.url import canonicalize_url, same_hostname
+from syndcrawler.core.policy import FetchAction, FetchEngine, NetworkRoute
+from syndcrawler.core.routes import ProxyMode, ProxyPool, RouteBroker
+from syndcrawler.core.url import canonicalize_url, hostname, same_hostname
 from syndcrawler.models import PageRecord
+
+_DIRECT_HTTP = FetchAction(FetchEngine.HTTP, NetworkRoute.DIRECT)
 
 
 class LocalCrawler:
@@ -15,15 +19,23 @@ class LocalCrawler:
 
     def __init__(self, config: CrawlConfig | None = None) -> None:
         self.config = config or CrawlConfig()
-        self.egress = EgressPolicy(allow_private_networks=self.config.allow_private_networks)
+        self.egress = EgressPolicy(
+            allow_private_networks=self.config.allow_private_networks,
+        )
 
     async def scrape(self, url: str) -> PageRecord | None:
         records = await self.crawl([url], follow_links=False, max_pages=1)
         return records[0] if records else None
 
-    async def crawl(self, seeds: list[str], *, follow_links: bool = True, max_pages: int | None = None) -> list[PageRecord]:
-        from crawlee import Request
-        from crawlee.crawlers import HttpCrawler, HttpCrawlingContext
+    async def crawl(
+        self,
+        seeds: list[str],
+        *,
+        follow_links: bool = True,
+        max_pages: int | None = None,
+    ) -> list[PageRecord]:
+        from crawlee import ProxyConfiguration, Request
+        from crawlee.crawlers import BasicCrawlingContext, HttpCrawler, HttpCrawlingContext
         from pydantic import ValidationError
         from selectolax.lexbor import LexborHTMLParser
 
@@ -32,11 +44,36 @@ class LocalCrawler:
         seed_hosts = tuple(safe_seeds)
         records: list[PageRecord] = []
 
+        safe_proxies = tuple(
+            [await self.egress.validate_proxy(url) for url in self.config.proxy_urls]
+        )
+        proxy_pool = ProxyPool(safe_proxies) if safe_proxies else None
+        broker = RouteBroker(proxy_pool=proxy_pool, mode=self.config.proxy_mode)
+
+        proxy_configuration = None
+        if proxy_pool is not None and self.config.proxy_mode is not ProxyMode.DIRECT:
+
+            async def choose_proxy(session_id, request):
+                if request is None:
+                    if self.config.proxy_mode is ProxyMode.REQUIRED:
+                        return proxy_pool.next(session_id)
+                    return None
+                context_key = f"{hostname(request.url)}:unknown"
+                decision = broker.choose(
+                    context_key,
+                    request.unique_key,
+                    session_id=session_id,
+                )
+                return decision.proxy_url
+
+            proxy_configuration = ProxyConfiguration(new_url_function=choose_proxy)
+
         crawler = HttpCrawler(
             max_requests_per_crawl=limit,
             max_request_retries=self.config.max_retries,
             max_concurrency=self.config.max_concurrency,
             respect_robots_txt_file=self.config.respect_robots_txt,
+            proxy_configuration=proxy_configuration,
         )
 
         @crawler.router.default_handler
@@ -51,12 +88,28 @@ class LocalCrawler:
             status_code = getattr(context.http_response, "status_code", None)
             headers = getattr(context.http_response, "headers", {})
             content_type = headers.get("content-type") if hasattr(headers, "get") else None
-            record = PageRecord(url=source_url, status_code=status_code if isinstance(status_code, int) else None, content_type=str(content_type) if content_type is not None else None, title=title, links=tuple(links))
+
+            selected = broker.selected_action(context.request.unique_key) or _DIRECT_HTTP
+            broker.observe(
+                context.request.unique_key,
+                success=True,
+                quality=1.0 if body else 0.25,
+            )
+            record = PageRecord(
+                url=source_url,
+                status_code=status_code if isinstance(status_code, int) else None,
+                content_type=str(content_type) if content_type is not None else None,
+                title=title,
+                links=tuple(links),
+                engine=selected.engine.value,
+                route=selected.route.value,
+            )
             records.append(record)
             await context.push_data(record.to_dict())
 
             if not follow_links:
                 return
+
             requests = []
             for link in links:
                 try:
@@ -66,12 +119,32 @@ class LocalCrawler:
             if requests:
                 await context.add_requests(requests)
 
+        @crawler.failed_request_handler
+        async def failed_handler(
+            context: BasicCrawlingContext,
+            error: Exception,
+        ) -> None:
+            broker.observe(
+                context.request.unique_key,
+                success=False,
+                quality=0.0,
+            )
+            context.log.error(
+                f"Request failed after retries: {context.request.url}: {error}"
+            )
+
         await crawler.run(safe_seeds)
+
         if self.config.output is not None:
             _write_records(self.config.output, records)
         return records
 
-    async def _extract_links(self, parser, source_url: str, seed_urls: tuple[str, ...]) -> list[str]:
+    async def _extract_links(
+        self,
+        parser,
+        source_url: str,
+        seed_urls: tuple[str, ...],
+    ) -> list[str]:
         seen: set[str] = set()
         result: list[str] = []
         for node in parser.css("a[href]"):
@@ -82,7 +155,9 @@ class LocalCrawler:
                 candidate = canonicalize_url(urljoin(source_url, href))
             except (ValueError, UnicodeError):
                 continue
-            if self.config.same_domain and not any(same_hostname(seed, candidate) for seed in seed_urls):
+            if self.config.same_domain and not any(
+                same_hostname(seed, candidate) for seed in seed_urls
+            ):
                 continue
             if candidate in seen:
                 continue
@@ -102,4 +177,12 @@ def _write_records(path: Path, records: list[PageRecord]) -> None:
             for record in records:
                 handle.write(json.dumps(record.to_dict(), ensure_ascii=False) + "\n")
         return
-    path.write_text(json.dumps([record.to_dict() for record in records], indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    path.write_text(
+        json.dumps(
+            [record.to_dict() for record in records],
+            indent=2,
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )

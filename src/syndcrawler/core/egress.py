@@ -35,7 +35,34 @@ class EgressPolicy:
         parsed = urlsplit(url)
         host = parsed.hostname
         assert host is not None
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        await self._validate_host(host, port, resolver=resolver)
+        return url
 
+    async def validate_proxy(self, value: str, *, resolver: Resolver | None = None) -> str:
+        """Validate an HTTP(S) proxy endpoint while allowing proxy credentials."""
+
+        try:
+            parsed = urlsplit(value)
+            if parsed.scheme.lower() not in {"http", "https"}:
+                raise UnsafeTargetError("proxy URL must use http or https")
+            if not parsed.hostname:
+                raise UnsafeTargetError("proxy URL must include a hostname")
+            if parsed.port is None:
+                raise UnsafeTargetError("proxy URL must include an explicit port")
+        except ValueError as exc:
+            raise UnsafeTargetError(str(exc)) from exc
+
+        await self._validate_host(parsed.hostname, parsed.port, resolver=resolver)
+        return value
+
+    async def _validate_host(
+        self,
+        host: str,
+        port: int,
+        *,
+        resolver: Resolver | None = None,
+    ) -> None:
         lowered = host.lower().rstrip(".")
         if lowered == "localhost" or lowered.endswith((".localhost", ".local")):
             if not self.allow_private_networks:
@@ -44,9 +71,8 @@ class EgressPolicy:
         literal = _parse_ip(host)
         if literal is not None:
             self._validate_ip(literal)
-            return url
+            return
 
-        port = parsed.port or (443 if parsed.scheme == "https" else 80)
         resolved = await (resolver or resolve_host)(host, port)
         if not resolved:
             raise UnsafeTargetError(f"hostname did not resolve: {host}")
@@ -57,8 +83,6 @@ class EgressPolicy:
             except ValueError as exc:
                 raise UnsafeTargetError(f"resolver returned invalid IP: {address}") from exc
             self._validate_ip(ip)
-
-        return url
 
     def _validate_ip(self, ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> None:
         if self.allow_private_networks:
