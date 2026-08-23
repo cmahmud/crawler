@@ -48,7 +48,7 @@ class ProxyPool:
 
 
 class RouteBroker:
-    """Select direct/proxy routes per contextual page class and learn from outcomes."""
+    """Select direct/proxy routes per engine and learn from contextual outcomes."""
 
     def __init__(
         self,
@@ -69,9 +69,10 @@ class RouteBroker:
         context_key: str,
         request_key: str,
         *,
+        engine: FetchEngine = FetchEngine.HTTP,
         session_id: str | None = None,
     ) -> RouteDecision:
-        actions = self._available_actions()
+        actions = self._available_actions(engine)
         action = self.policy.choose(context_key, actions)
         proxy_url = None
         if action.route is NetworkRoute.PROXY:
@@ -112,9 +113,9 @@ class RouteBroker:
         pending = self._pending.get(request_key)
         return pending.action if pending is not None else None
 
-    def _available_actions(self) -> list[FetchAction]:
-        direct = FetchAction(FetchEngine.HTTP, NetworkRoute.DIRECT)
-        proxy = FetchAction(FetchEngine.HTTP, NetworkRoute.PROXY)
+    def _available_actions(self, engine: FetchEngine) -> list[FetchAction]:
+        direct = FetchAction(engine, NetworkRoute.DIRECT)
+        proxy = FetchAction(engine, NetworkRoute.PROXY)
         if self.mode is ProxyMode.DIRECT or self.proxy_pool is None:
             return [direct]
         if self.mode is ProxyMode.REQUIRED:
