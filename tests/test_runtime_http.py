@@ -12,7 +12,7 @@ from syndcrawler.runtime import LocalCrawler
 
 
 class _Handler(BaseHTTPRequestHandler):
-    def do_GET(self) -> None:  # noqa: N802 - stdlib handler API
+    def do_GET(self) -> None:
         if self.path == "/":
             self._html(
                 "<html><head><title>Root</title></head>"
