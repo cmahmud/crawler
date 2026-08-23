@@ -34,8 +34,9 @@ class LocalCrawler:
         follow_links: bool = True,
         max_pages: int | None = None,
     ) -> list[PageRecord]:
-        from crawlee import ProxyConfiguration, Request
+        from crawlee import Request
         from crawlee.crawlers import BasicCrawlingContext, HttpCrawler, HttpCrawlingContext
+        from crawlee.proxy_configuration import ProxyConfiguration
         from pydantic import ValidationError
         from selectolax.lexbor import LexborHTMLParser
 
