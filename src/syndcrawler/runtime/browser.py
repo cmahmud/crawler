@@ -67,12 +67,14 @@ class BrowserRenderer:
                         return self.proxy_pool.next(session_id)
                     return None
                 request_key = f"browser:{request.unique_key}"
-                decision = self.broker.choose(
-                    f"{hostname(request.url)}:unknown",
-                    request_key,
-                    engine=FetchEngine.BROWSER,
-                    session_id=session_id,
-                )
+                decision = self.broker.pending_decision(request_key)
+                if decision is None:
+                    decision = self.broker.choose(
+                        f"{hostname(request.url)}:unknown",
+                        request_key,
+                        engine=FetchEngine.BROWSER,
+                        session_id=session_id,
+                    )
                 return decision.proxy_url
 
             proxy_configuration = ProxyConfiguration(new_url_function=choose_proxy)
@@ -100,6 +102,17 @@ class BrowserRenderer:
             retry_on_blocked=False,
             proxy_configuration=proxy_configuration,
         )
+
+        @crawler.pre_navigation_hook
+        async def select_route(context: BasicCrawlingContext) -> None:
+            request_key = f"browser:{context.request.unique_key}"
+            session_id = context.session.id if context.session is not None else None
+            self.broker.choose(
+                f"{hostname(context.request.url)}:unknown",
+                request_key,
+                engine=FetchEngine.BROWSER,
+                session_id=session_id,
+            )
 
         @crawler.router.default_handler
         async def handler(context: PlaywrightCrawlingContext) -> None:
