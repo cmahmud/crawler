@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from datetime import timedelta
 from pathlib import Path
 
@@ -121,12 +122,10 @@ class BrowserRenderer:
                 context.log.error(f"Browser navigation violated egress policy: {exc}")
                 return
 
-            if self.config.browser_settle_seconds:
-                await context.page.wait_for_timeout(
-                    self.config.browser_settle_seconds * 1000
-                )
-
-            html = await context.page.content()
+            html = await _wait_for_dom_settle(
+                context.page,
+                max_wait_seconds=self.config.browser_settle_seconds,
+            )
             parsed = parse_html(html, source_url)
             links = await self._safe_links(parsed.links, seed_urls)
             self.broker.observe(request_key, success=True, quality=1.0 if html else 0.25)
@@ -173,3 +172,36 @@ class BrowserRenderer:
             except UnsafeTargetError:
                 continue
         return safe
+
+
+async def _wait_for_dom_settle(page, *, max_wait_seconds: float) -> str:
+    """Return HTML after the DOM becomes stable or the configured ceiling expires.
+
+    A single sleep is fragile on loaded CI/VPS hosts. This bounded sampler waits for
+    two consecutive identical DOM snapshots, but never exits before a small minimum
+    observation window so short client-side timers get a chance to run.
+    """
+
+    if max_wait_seconds <= 0:
+        return await page.content()
+
+    started = time.monotonic()
+    deadline = started + max_wait_seconds
+    earliest_exit = started + min(max_wait_seconds, max(0.1, max_wait_seconds / 2))
+    interval = min(0.1, max(0.025, max_wait_seconds / 4))
+    previous = await page.content()
+    stable_samples = 0
+
+    while time.monotonic() < deadline:
+        remaining = deadline - time.monotonic()
+        await page.wait_for_timeout(min(interval, max(0.0, remaining)) * 1000)
+        current = await page.content()
+        if current == previous:
+            stable_samples += 1
+            if stable_samples >= 2 and time.monotonic() >= earliest_exit:
+                return current
+        else:
+            previous = current
+            stable_samples = 0
+
+    return previous
