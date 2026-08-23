@@ -1,21 +1,24 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
-from urllib.parse import urljoin
 
 from syndcrawler.config import CrawlConfig
 from syndcrawler.core.egress import EgressPolicy, UnsafeTargetError
 from syndcrawler.core.policy import FetchAction, FetchEngine, NetworkRoute
+from syndcrawler.core.rendering import assess_rendering
 from syndcrawler.core.routes import ProxyMode, ProxyPool, RouteBroker
-from syndcrawler.core.url import canonicalize_url, hostname, same_hostname
+from syndcrawler.core.url import hostname, same_hostname
 from syndcrawler.models import PageRecord
+from syndcrawler.runtime.browser import BrowserRenderer
+from syndcrawler.runtime.html import parse_html
 
 _DIRECT_HTTP = FetchAction(FetchEngine.HTTP, NetworkRoute.DIRECT)
 
 
 class LocalCrawler:
-    """Single-process crawler using Crawlee's Impit-backed HTTP runtime."""
+    """Single-process adaptive crawler using Crawlee's Impit HTTP runtime."""
 
     def __init__(self, config: CrawlConfig | None = None) -> None:
         self.config = config or CrawlConfig()
@@ -38,12 +41,12 @@ class LocalCrawler:
         from crawlee.crawlers import BasicCrawlingContext, HttpCrawler, HttpCrawlingContext
         from crawlee.proxy_configuration import ProxyConfiguration
         from pydantic import ValidationError
-        from selectolax.lexbor import LexborHTMLParser
 
         limit = max_pages or self.config.max_pages
         safe_seeds = [await self.egress.validate(seed) for seed in seeds]
         seed_hosts = tuple(safe_seeds)
         records: list[PageRecord] = []
+        browser_candidates: dict[str, PageRecord] = {}
 
         safe_proxies = tuple(
             [await self.egress.validate_proxy(url) for url in self.config.proxy_urls]
@@ -82,32 +85,50 @@ class LocalCrawler:
 
         @crawler.router.default_handler
         async def handler(context: HttpCrawlingContext) -> None:
-            source_url = canonicalize_url(context.request.url)
+            source_url = await self.egress.validate(context.request.url)
             body = await context.http_response.read()
-            parser = LexborHTMLParser(body)
-            title_node = parser.css_first("title")
-            title = title_node.text(strip=True) if title_node is not None else None
-            links = await self._extract_links(parser, source_url, seed_hosts)
+            parsed = parse_html(body, source_url)
+            links = await self._safe_links(parsed.links, seed_hosts)
+            rendering = assess_rendering(body)
 
             status_code = getattr(context.http_response, "status_code", None)
             headers = getattr(context.http_response, "headers", {})
             content_type = headers.get("content-type") if hasattr(headers, "get") else None
 
             selected = broker.selected_action(context.request.unique_key) or _DIRECT_HTTP
+            should_render = self.config.browser_enabled and rendering.requires_browser
             broker.observe(
                 context.request.unique_key,
                 success=True,
-                quality=1.0 if body else 0.25,
+                quality=0.2 if should_render else (1.0 if body else 0.25),
             )
+
             record = PageRecord(
                 url=source_url,
                 status_code=status_code if isinstance(status_code, int) else None,
                 content_type=str(content_type) if content_type is not None else None,
-                title=title,
+                title=parsed.title,
                 links=tuple(links),
                 engine=selected.engine.value,
                 route=selected.route.value,
+                metadata={
+                    "rendering_assessment": {
+                        "requires_browser": rendering.requires_browser,
+                        "score": rendering.score,
+                        "visible_text_length": rendering.visible_text_length,
+                        "script_count": rendering.script_count,
+                        "reasons": list(rendering.reasons),
+                    }
+                },
             )
+
+            if should_render:
+                browser_candidates[source_url] = record
+                context.log.info(
+                    f"Deferring client-rendered shell to browser: {source_url}"
+                )
+                return
+
             records.append(record)
             await context.push_data(record.to_dict())
 
@@ -139,39 +160,64 @@ class LocalCrawler:
 
         await crawler.run(safe_seeds)
 
+        if browser_candidates:
+            renderer = BrowserRenderer(
+                self.config,
+                egress=self.egress,
+                broker=broker,
+                proxy_pool=proxy_pool,
+            )
+            rendered = await renderer.render(
+                list(browser_candidates),
+                seed_urls=seed_hosts,
+            )
+            for url, static_record in browser_candidates.items():
+                browser_record = rendered.get(url)
+                if browser_record is not None:
+                    records.append(
+                        replace(
+                            browser_record,
+                            metadata={
+                                **static_record.metadata,
+                                **browser_record.metadata,
+                                "escalated_from": "http",
+                            },
+                        )
+                    )
+                    continue
+                records.append(
+                    replace(
+                        static_record,
+                        metadata={
+                            **static_record.metadata,
+                            "browser_escalation": {
+                                "attempted": True,
+                                "succeeded": False,
+                            },
+                        },
+                    )
+                )
+
         if self.config.output is not None:
             _write_records(self.config.output, records)
         return records
 
-    async def _extract_links(
+    async def _safe_links(
         self,
-        parser,
-        source_url: str,
+        links: tuple[str, ...],
         seed_urls: tuple[str, ...],
     ) -> list[str]:
-        seen: set[str] = set()
-        result: list[str] = []
-        for node in parser.css("a[href]"):
-            href = node.attributes.get("href")
-            if not href or href.startswith(("#", "javascript:", "mailto:", "tel:")):
-                continue
-            try:
-                candidate = canonicalize_url(urljoin(source_url, href))
-            except (ValueError, UnicodeError):
-                continue
+        safe: list[str] = []
+        for candidate in links:
             if self.config.same_domain and not any(
                 same_hostname(seed, candidate) for seed in seed_urls
             ):
                 continue
-            if candidate in seen:
-                continue
             try:
-                candidate = await self.egress.validate(candidate)
+                safe.append(await self.egress.validate(candidate))
             except UnsafeTargetError:
                 continue
-            seen.add(candidate)
-            result.append(candidate)
-        return result
+        return safe
 
 
 def _write_records(path: Path, records: list[PageRecord]) -> None:
