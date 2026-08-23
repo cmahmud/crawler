@@ -65,12 +65,13 @@ class LocalCrawler:
                     if self.config.proxy_mode is ProxyMode.REQUIRED:
                         return proxy_pool.next(session_id)
                     return None
-                context_key = f"{hostname(request.url)}:unknown"
-                decision = broker.choose(
-                    context_key,
-                    request.unique_key,
-                    session_id=session_id,
-                )
+                decision = broker.pending_decision(request.unique_key)
+                if decision is None:
+                    decision = broker.choose(
+                        f"{hostname(request.url)}:unknown",
+                        request.unique_key,
+                        session_id=session_id,
+                    )
                 return decision.proxy_url
 
             proxy_configuration = ProxyConfiguration(new_url_function=choose_proxy)
@@ -87,9 +88,19 @@ class LocalCrawler:
             proxy_configuration=proxy_configuration,
         )
 
+        @crawler.pre_navigation_hook
+        async def select_route(context: BasicCrawlingContext) -> None:
+            session_id = context.session.id if context.session is not None else None
+            broker.choose(
+                f"{hostname(context.request.url)}:unknown",
+                context.request.unique_key,
+                session_id=session_id,
+            )
+
         @crawler.router.default_handler
         async def handler(context: HttpCrawlingContext) -> None:
-            source_url = await self.egress.validate(context.request.url)
+            loaded_url = context.request.loaded_url or context.request.url
+            source_url = await self.egress.validate(loaded_url)
             body = await context.http_response.read()
             parsed = parse_html(body, source_url)
             links = await self._safe_links(parsed.links, seed_hosts)
@@ -116,13 +127,14 @@ class LocalCrawler:
                 engine=selected.engine.value,
                 route=selected.route.value,
                 metadata={
+                    "requested_url": context.request.url,
                     "rendering_assessment": {
                         "requires_browser": rendering.requires_browser,
                         "score": rendering.score,
                         "visible_text_length": rendering.visible_text_length,
                         "script_count": rendering.script_count,
                         "reasons": list(rendering.reasons),
-                    }
+                    },
                 },
             )
 
