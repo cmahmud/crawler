@@ -1,4 +1,4 @@
-from syndcrawler.core.policy import AdaptivePolicy, NetworkRoute
+from syndcrawler.core.policy import AdaptivePolicy, FetchEngine, NetworkRoute
 from syndcrawler.core.routes import ProxyMode, ProxyPool, RouteBroker
 
 
@@ -26,6 +26,20 @@ def test_required_mode_uses_sticky_proxy_session() -> None:
     second = broker.choose("example.com:unknown", "request-2", session_id="abc")
     assert first.proxy_url == second.proxy_url
     assert first.action.route is NetworkRoute.PROXY
+
+
+def test_required_mode_preserves_requested_engine() -> None:
+    broker = RouteBroker(
+        proxy_pool=ProxyPool(("http://proxy.example:8000",)),
+        mode=ProxyMode.REQUIRED,
+    )
+    decision = broker.choose(
+        "example.com:product",
+        "browser-request",
+        engine=FetchEngine.BROWSER,
+    )
+    assert decision.action.engine is FetchEngine.BROWSER
+    assert decision.action.route is NetworkRoute.PROXY
 
 
 def test_auto_mode_learns_proxy_when_direct_fails() -> None:
