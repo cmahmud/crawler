@@ -41,6 +41,7 @@ class BrowserRenderer:
             return {}
 
         try:
+            from crawlee import ConcurrencySettings
             from crawlee.crawlers import (
                 BasicCrawlingContext,
                 PlaywrightCrawler,
@@ -86,7 +87,11 @@ class BrowserRenderer:
             browser_launch_options=launch_options or None,
             max_requests_per_crawl=len(safe_urls),
             max_request_retries=0,
-            max_concurrency=self.config.browser_max_concurrency,
+            concurrency_settings=ConcurrencySettings(
+                min_concurrency=1,
+                desired_concurrency=1,
+                max_concurrency=self.config.browser_max_concurrency,
+            ),
             navigation_timeout=timedelta(
                 seconds=self.config.browser_navigation_timeout_seconds
             ),
