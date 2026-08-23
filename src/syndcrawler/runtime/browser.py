@@ -97,7 +97,7 @@ class BrowserRenderer:
 
         @crawler.router.default_handler
         async def handler(context: PlaywrightCrawlingContext) -> None:
-            source_url = canonicalize_url(context.page.url)
+            original_url = canonicalize_url(context.request.url)
             request_key = f"browser:{context.request.unique_key}"
             selected = self.broker.selected_action(request_key) or _BROWSER_DIRECT
             status_code = context.response.status
@@ -107,6 +107,13 @@ class BrowserRenderer:
                 context.log.warning(
                     f"Browser rendering stopped at access-controlled response: {status_code}"
                 )
+                return
+
+            try:
+                source_url = await self.egress.validate(context.page.url)
+            except UnsafeTargetError as exc:
+                self.broker.observe(request_key, success=False, quality=0.0)
+                context.log.error(f"Browser navigation violated egress policy: {exc}")
                 return
 
             if self.config.browser_settle_seconds:
@@ -128,9 +135,9 @@ class BrowserRenderer:
                 links=tuple(links),
                 engine=selected.engine.value,
                 route=selected.route.value,
-                metadata={"rendered": True},
+                metadata={"rendered": True, "requested_url": original_url},
             )
-            records[source_url] = record
+            records[original_url] = record
             await context.push_data(record.to_dict())
 
         @crawler.failed_request_handler
