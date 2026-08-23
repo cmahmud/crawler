@@ -64,9 +64,11 @@ class EgressPolicy:
         resolver: Resolver | None = None,
     ) -> None:
         lowered = host.lower().rstrip(".")
-        if lowered == "localhost" or lowered.endswith((".localhost", ".local")):
-            if not self.allow_private_networks:
-                raise UnsafeTargetError(f"local hostname is blocked: {host}")
+        if (
+            not self.allow_private_networks
+            and (lowered == "localhost" or lowered.endswith((".localhost", ".local")))
+        ):
+            raise UnsafeTargetError(f"local hostname is blocked: {host}")
 
         literal = _parse_ip(host)
         if literal is not None:

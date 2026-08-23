@@ -48,7 +48,10 @@ class LocalCrawler:
             [await self.egress.validate_proxy(url) for url in self.config.proxy_urls]
         )
         proxy_pool = ProxyPool(safe_proxies) if safe_proxies else None
-        broker = RouteBroker(proxy_pool=proxy_pool, mode=self.config.proxy_mode)
+        broker = RouteBroker(
+            proxy_pool=proxy_pool,
+            mode=self.config.proxy_mode,
+        )
 
         proxy_configuration = None
         if proxy_pool is not None and self.config.proxy_mode is not ProxyMode.DIRECT:

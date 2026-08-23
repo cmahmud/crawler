@@ -34,7 +34,11 @@ class ActionStats:
 
 
 class AdaptivePolicy:
-    """Transparent EMA policy for fetch engine/network route selection."""
+    """Small contextual policy learner for fetch engine/network route selection.
+
+    The first version deliberately uses transparent EMA scoring rather than an
+    opaque model. It is easy to inspect, persist, benchmark and replace later.
+    """
 
     def __init__(self, *, alpha: float = 0.2, exploration_interval: int = 20) -> None:
         if not 0 < alpha <= 1:
@@ -49,17 +53,33 @@ class AdaptivePolicy:
     def choose(self, context_key: str, actions: list[FetchAction]) -> FetchAction:
         if not actions:
             raise ValueError("at least one fetch action is required")
+
         decision = self._decisions.get(context_key, 0) + 1
         self._decisions[context_key] = decision
+
         if decision % self.exploration_interval == 0:
             return min(actions, key=lambda action: self.stats(context_key, action).samples)
-        return max(actions, key=lambda action: self._score(self.stats(context_key, action), action))
 
-    def observe(self, context_key: str, action: FetchAction, *, success: bool, quality: float, latency_ms: float, cost: float = 0.0) -> None:
+        return max(
+            actions,
+            key=lambda action: self._score(self.stats(context_key, action), action),
+        )
+
+    def observe(
+        self,
+        context_key: str,
+        action: FetchAction,
+        *,
+        success: bool,
+        quality: float,
+        latency_ms: float,
+        cost: float = 0.0,
+    ) -> None:
         if not 0 <= quality <= 1:
             raise ValueError("quality must be between 0 and 1")
         if latency_ms < 0 or cost < 0:
             raise ValueError("latency and cost cannot be negative")
+
         stats = self.stats(context_key, action)
         stats.samples += 1
         stats.success_ema = self._ema(stats.success_ema, 1.0 if success else 0.0)
@@ -80,5 +100,14 @@ class AdaptivePolicy:
         cost_penalty = min(stats.cost_ema, 0.25)
         browser_penalty = 0.04 if action.engine is FetchEngine.BROWSER else 0.0
         proxy_penalty = 0.02 if action.route is NetworkRoute.PROXY else 0.0
-        cold_start_bonus = 0.015 if stats.samples == 0 and action.engine is FetchEngine.HTTP else 0.0
-        return success_quality - latency_penalty - cost_penalty - browser_penalty - proxy_penalty + cold_start_bonus
+        cold_start_bonus = (
+            0.015 if stats.samples == 0 and action.engine is FetchEngine.HTTP else 0.0
+        )
+        return (
+            success_quality
+            - latency_penalty
+            - cost_penalty
+            - browser_penalty
+            - proxy_penalty
+            + cold_start_bonus
+        )

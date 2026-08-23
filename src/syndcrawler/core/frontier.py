@@ -28,7 +28,7 @@ class FrontierRequest:
     available_at: float = 0.0
     metadata: dict[str, Any] = field(default_factory=dict)
 
-    def normalized(self) -> "FrontierRequest":
+    def normalized(self) -> FrontierRequest:
         url = canonicalize_url(self.url)
         return replace(self, url=url, queue_key=self.queue_key or hostname(url))
 
@@ -70,7 +70,11 @@ class _QueueRuntime:
 
 
 class MemoryFrontier:
-    """Lease-based local frontier with host-affine politeness semantics."""
+    """Lease-based local frontier with host-affine politeness semantics.
+
+    It is intentionally storage-neutral in behavior so Redis/SQL/frontier-service
+    backends can implement the same contract later without changing workers.
+    """
 
     def __init__(self) -> None:
         self._entries: dict[str, dict[str, _Entry]] = {}
@@ -91,7 +95,12 @@ class MemoryFrontier:
                 added += 1
             return added
 
-    async def set_queue_policy(self, crawl_id: str, queue_key: str, policy: QueuePolicy) -> None:
+    async def set_queue_policy(
+        self,
+        crawl_id: str,
+        queue_key: str,
+        policy: QueuePolicy,
+    ) -> None:
         if policy.max_concurrency <= 0:
             raise ValueError("max_concurrency must be positive")
         if policy.delay_seconds < 0:
@@ -101,7 +110,14 @@ class MemoryFrontier:
         async with self._lock:
             self._queue(crawl_id, queue_key).policy = policy
 
-    async def lease(self, crawl_id: str, *, limit: int = 1, lease_seconds: float = 60.0, now: float | None = None) -> list[FrontierLease]:
+    async def lease(
+        self,
+        crawl_id: str,
+        *,
+        limit: int = 1,
+        lease_seconds: float = 60.0,
+        now: float | None = None,
+    ) -> list[FrontierLease]:
         if limit <= 0:
             raise ValueError("limit must be positive")
         if lease_seconds <= 0:
@@ -110,13 +126,21 @@ class MemoryFrontier:
         current = time.time() if now is None else now
         async with self._lock:
             crawl = self._entries.setdefault(crawl_id, {})
-            self._reclaim_expired(crawl_id, crawl, current)
+            self._reclaim_expired(crawl, current)
 
             heap: list[tuple[int, float, int, str]] = []
             for url, entry in crawl.items():
                 if entry.state != RequestState.QUEUED or entry.request.available_at > current:
                     continue
-                heapq.heappush(heap, (-entry.request.priority, entry.request.available_at, entry.sequence, url))
+                heapq.heappush(
+                    heap,
+                    (
+                        -entry.request.priority,
+                        entry.request.available_at,
+                        entry.sequence,
+                        url,
+                    ),
+                )
 
             leases: list[FrontierLease] = []
             while heap and len(leases) < limit:
@@ -144,7 +168,15 @@ class MemoryFrontier:
                 if policy.delay_seconds:
                     queue.next_allowed_at = current + policy.delay_seconds
 
-                leases.append(FrontierLease(request=entry.request, token=token, attempt=entry.attempt, leased_at=current, expires_at=entry.lease_expires_at))
+                leases.append(
+                    FrontierLease(
+                        request=entry.request,
+                        token=token,
+                        attempt=entry.attempt,
+                        leased_at=current,
+                        expires_at=entry.lease_expires_at,
+                    )
+                )
 
             return leases
 
@@ -156,7 +188,13 @@ class MemoryFrontier:
             entry.lease_token = None
             entry.lease_expires_at = 0.0
 
-    async def retry(self, lease: FrontierLease, *, available_at: float, error: str | None = None) -> None:
+    async def retry(
+        self,
+        lease: FrontierLease,
+        *,
+        available_at: float,
+        error: str | None = None,
+    ) -> None:
         async with self._lock:
             entry = self._active_entry(lease)
             self._release_queue(entry)
@@ -197,8 +235,7 @@ class MemoryFrontier:
         queue = self._queue(entry.request.crawl_id, key)
         queue.active = max(0, queue.active - 1)
 
-    def _reclaim_expired(self, crawl_id: str, crawl: dict[str, _Entry], now: float) -> None:
-        del crawl_id
+    def _reclaim_expired(self, crawl: dict[str, _Entry], now: float) -> None:
         for entry in crawl.values():
             if entry.state != RequestState.LEASED or entry.lease_expires_at > now:
                 continue
