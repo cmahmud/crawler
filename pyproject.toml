@@ -1,0 +1,50 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "syndcrawler"
+version = "0.1.0"
+description = "Adaptive, self-hostable web crawler with safe local and server deployment modes."
+readme = "README.md"
+requires-python = ">=3.12"
+license = { file = "LICENSE" }
+authors = [{ name = "cmahmud" }]
+dependencies = [
+  "crawlee>=1.9,<2",
+  "selectolax>=0.3.30,<1",
+]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "License :: OSI Approved :: Apache Software License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Internet :: WWW/HTTP :: Indexing/Search",
+]
+
+[project.optional-dependencies]
+browser = ["crawlee[playwright]>=1.9,<2"]
+dev = [
+  "pytest>=8.4,<9",
+  "pytest-asyncio>=1.1,<2",
+  "ruff>=0.12,<1",
+]
+
+[project.scripts]
+syndcrawler = "syndcrawler.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/syndcrawler"]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM", "RUF"]
