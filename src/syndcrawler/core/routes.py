@@ -22,7 +22,7 @@ class RouteDecision:
 @dataclass(slots=True)
 class _PendingDecision:
     context_key: str
-    action: FetchAction
+    decision: RouteDecision
     started_at: float
 
 
@@ -72,6 +72,10 @@ class RouteBroker:
         engine: FetchEngine = FetchEngine.HTTP,
         session_id: str | None = None,
     ) -> RouteDecision:
+        existing = self.pending_decision(request_key)
+        if existing is not None:
+            return existing
+
         actions = self._available_actions(engine)
         action = self.policy.choose(context_key, actions)
         proxy_url = None
@@ -79,12 +83,13 @@ class RouteBroker:
             assert self.proxy_pool is not None
             proxy_url = self.proxy_pool.next(session_id)
 
+        decision = RouteDecision(action=action, proxy_url=proxy_url)
         self._pending[request_key] = _PendingDecision(
             context_key=context_key,
-            action=action,
+            decision=decision,
             started_at=time.monotonic(),
         )
-        return RouteDecision(action=action, proxy_url=proxy_url)
+        return decision
 
     def observe(
         self,
@@ -102,16 +107,20 @@ class RouteBroker:
             latency_ms = (time.monotonic() - pending.started_at) * 1000
         self.policy.observe(
             pending.context_key,
-            pending.action,
+            pending.decision.action,
             success=success,
             quality=quality,
             latency_ms=latency_ms,
             cost=cost,
         )
 
-    def selected_action(self, request_key: str) -> FetchAction | None:
+    def pending_decision(self, request_key: str) -> RouteDecision | None:
         pending = self._pending.get(request_key)
-        return pending.action if pending is not None else None
+        return pending.decision if pending is not None else None
+
+    def selected_action(self, request_key: str) -> FetchAction | None:
+        decision = self.pending_decision(request_key)
+        return decision.action if decision is not None else None
 
     def _available_actions(self, engine: FetchEngine) -> list[FetchAction]:
         direct = FetchAction(engine, NetworkRoute.DIRECT)
