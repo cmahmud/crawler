@@ -137,7 +137,7 @@ class BrowserRenderer:
 
             html = await _wait_for_dom_settle(
                 context.page,
-                max_wait_seconds=self.config.browser_settle_seconds,
+                settle_seconds=self.config.browser_settle_seconds,
             )
             parsed = parse_html(html, source_url)
             links = await self._safe_links(parsed.links, seed_urls)
@@ -187,23 +187,23 @@ class BrowserRenderer:
         return safe
 
 
-async def _wait_for_dom_settle(page, *, max_wait_seconds: float) -> str:
-    """Return HTML after the DOM becomes stable or the configured ceiling expires.
+async def _wait_for_dom_settle(page, *, settle_seconds: float) -> str:
+    """Return HTML after a minimum settle period and a bounded stability window.
 
-    A single sleep is fragile on loaded CI/VPS hosts. This bounded sampler waits for
-    two consecutive identical DOM snapshots, but never exits before a small minimum
-    observation window so short client-side timers get a chance to run.
+    The configured settle time is a minimum observation period, not a hard ceiling.
+    Loaded CI/VPS hosts can delay short JavaScript timers, so after the minimum wait
+    we sample the DOM until two consecutive snapshots match or a short safety
+    ceiling expires.
     """
 
-    if max_wait_seconds <= 0:
+    if settle_seconds <= 0:
         return await page.content()
 
-    started = time.monotonic()
-    deadline = started + max_wait_seconds
-    earliest_exit = started + min(max_wait_seconds, max(0.1, max_wait_seconds / 2))
-    interval = min(0.1, max(0.025, max_wait_seconds / 4))
+    await page.wait_for_timeout(settle_seconds * 1000)
     previous = await page.content()
     stable_samples = 0
+    interval = min(0.1, max(0.025, settle_seconds / 2))
+    deadline = time.monotonic() + max(0.5, settle_seconds * 4)
 
     while time.monotonic() < deadline:
         remaining = deadline - time.monotonic()
@@ -211,7 +211,7 @@ async def _wait_for_dom_settle(page, *, max_wait_seconds: float) -> str:
         current = await page.content()
         if current == previous:
             stable_samples += 1
-            if stable_samples >= 2 and time.monotonic() >= earliest_exit:
+            if stable_samples >= 2:
                 return current
         else:
             previous = current
