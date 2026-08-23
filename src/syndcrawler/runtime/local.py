@@ -37,7 +37,7 @@ class LocalCrawler:
         follow_links: bool = True,
         max_pages: int | None = None,
     ) -> list[PageRecord]:
-        from crawlee import Request
+        from crawlee import ConcurrencySettings, Request
         from crawlee.crawlers import BasicCrawlingContext, HttpCrawler, HttpCrawlingContext
         from crawlee.proxy_configuration import ProxyConfiguration
         from pydantic import ValidationError
@@ -78,7 +78,11 @@ class LocalCrawler:
         crawler = HttpCrawler(
             max_requests_per_crawl=limit,
             max_request_retries=self.config.max_retries,
-            max_concurrency=self.config.max_concurrency,
+            concurrency_settings=ConcurrencySettings(
+                min_concurrency=1,
+                desired_concurrency=min(4, self.config.max_concurrency),
+                max_concurrency=self.config.max_concurrency,
+            ),
             respect_robots_txt_file=self.config.respect_robots_txt,
             proxy_configuration=proxy_configuration,
         )
