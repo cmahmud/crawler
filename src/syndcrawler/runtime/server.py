@@ -17,6 +17,18 @@ _SITEMAP_PRIORITY = -10
 _EMPTY_BATCH = WorkerBatchResult(leased=0, persisted=0, failed=0, discovered=0)
 
 
+class CrawlNotFoundError(ValueError):
+    """Raised when a server crawl ID has no durable manifest."""
+
+
+class CrawlConflictError(ValueError):
+    """Raised when an existing crawl conflicts with a requested definition."""
+
+
+class CrawlStateError(ValueError):
+    """Raised when a lifecycle transition is invalid for the current state."""
+
+
 @dataclass(frozen=True, slots=True)
 class ServerCrawlStatus:
     crawl_id: str
@@ -179,9 +191,9 @@ class ServerRuntime:
         await self._manifest(crawl_id)
         lifecycle = await self._lifecycle(crawl_id)
         if lifecycle == "completed":
-            raise ValueError(f"completed crawl cannot be paused: {crawl_id}")
+            raise CrawlStateError(f"completed crawl cannot be paused: {crawl_id}")
         if lifecycle == "cancelled":
-            raise ValueError(f"cancelled crawl cannot be paused: {crawl_id}")
+            raise CrawlStateError(f"cancelled crawl cannot be paused: {crawl_id}")
         if lifecycle != "paused":
             await self.store.set_lifecycle(crawl_id, "paused")
         return await self.status(crawl_id)
@@ -191,9 +203,9 @@ class ServerRuntime:
         manifest = await self._manifest(crawl_id)
         lifecycle = await self._lifecycle(crawl_id)
         if lifecycle == "completed":
-            raise ValueError(f"completed crawl cannot be resumed: {crawl_id}")
+            raise CrawlStateError(f"completed crawl cannot be resumed: {crawl_id}")
         if lifecycle == "cancelled":
-            raise ValueError(f"cancelled crawl cannot be resumed: {crawl_id}")
+            raise CrawlStateError(f"cancelled crawl cannot be resumed: {crawl_id}")
         if lifecycle != "active":
             await self.store.set_lifecycle(crawl_id, "active")
         await self._repair_frontier(manifest)
@@ -204,7 +216,7 @@ class ServerRuntime:
         await self._manifest(crawl_id)
         lifecycle = await self._lifecycle(crawl_id)
         if lifecycle == "completed":
-            raise ValueError(f"completed crawl cannot be cancelled: {crawl_id}")
+            raise CrawlStateError(f"completed crawl cannot be cancelled: {crawl_id}")
         if lifecycle != "cancelled":
             await self.store.set_lifecycle(crawl_id, "cancelled")
             await self.frontier.purge(crawl_id)
@@ -306,13 +318,13 @@ class ServerRuntime:
     async def _manifest(self, crawl_id: str) -> CrawlManifest:
         manifest = await self.store.get_manifest(crawl_id)
         if manifest is None:
-            raise ValueError(f"crawl manifest does not exist: {crawl_id}")
+            raise CrawlNotFoundError(f"crawl manifest does not exist: {crawl_id}")
         return manifest
 
     async def _lifecycle(self, crawl_id: str) -> str:
         lifecycle = await self.store.get_lifecycle(crawl_id)
         if lifecycle is None:
-            raise ValueError(f"crawl manifest does not exist: {crawl_id}")
+            raise CrawlNotFoundError(f"crawl manifest does not exist: {crawl_id}")
         return lifecycle
 
     async def _repair_frontier(self, manifest: CrawlManifest) -> None:
@@ -389,6 +401,6 @@ def _require_matching_manifest(
         or manifest.same_domain != same_domain
         or manifest.max_pages != max_pages
     ):
-        raise ValueError(
+        raise CrawlConflictError(
             f"crawl already exists with different configuration: {manifest.crawl_id}"
         )
