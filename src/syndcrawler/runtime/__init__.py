@@ -4,7 +4,7 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from syndcrawler.runtime.local import LocalCrawler
-    from syndcrawler.runtime.recrawl import RecrawlItemResult, RecrawlRunResult, RecrawlRunner
+    from syndcrawler.runtime.recrawl import RecrawlItemResult, RecrawlRunner, RecrawlRunResult
     from syndcrawler.runtime.resumable import CrawlRunResult, ResumableCrawler
 
 __all__ = [
@@ -34,8 +34,8 @@ def __getattr__(name: str) -> Any:
     if name in {"RecrawlItemResult", "RecrawlRunResult", "RecrawlRunner"}:
         from syndcrawler.runtime.recrawl import (
             RecrawlItemResult,
-            RecrawlRunResult,
             RecrawlRunner,
+            RecrawlRunResult,
         )
 
         return {
