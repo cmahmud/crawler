@@ -6,14 +6,17 @@ if TYPE_CHECKING:
     from syndcrawler.runtime.local import LocalCrawler
     from syndcrawler.runtime.recrawl import RecrawlItemResult, RecrawlRunner, RecrawlRunResult
     from syndcrawler.runtime.resumable import CrawlRunResult, ResumableCrawler
+    from syndcrawler.runtime.worker import CrawlWorker, WorkerBatchResult
 
 __all__ = [
     "CrawlRunResult",
+    "CrawlWorker",
     "LocalCrawler",
     "RecrawlItemResult",
     "RecrawlRunResult",
     "RecrawlRunner",
     "ResumableCrawler",
+    "WorkerBatchResult",
 ]
 
 
@@ -42,5 +45,12 @@ def __getattr__(name: str) -> Any:
             "RecrawlItemResult": RecrawlItemResult,
             "RecrawlRunResult": RecrawlRunResult,
             "RecrawlRunner": RecrawlRunner,
+        }[name]
+    if name in {"CrawlWorker", "WorkerBatchResult"}:
+        from syndcrawler.runtime.worker import CrawlWorker, WorkerBatchResult
+
+        return {
+            "CrawlWorker": CrawlWorker,
+            "WorkerBatchResult": WorkerBatchResult,
         }[name]
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
