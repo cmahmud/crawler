@@ -4,7 +4,7 @@ All notable project changes will be documented in this file.
 
 The format is based on Keep a Changelog principles. SyndCrawler is currently pre-stable; interfaces may still change between minor releases.
 
-## [0.1.0] - Unreleased
+## [0.1.0] - 2026-08-23
 
 ### Added
 
