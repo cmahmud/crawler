@@ -14,6 +14,7 @@ CREATE TABLE IF NOT EXISTS crawl_manifests (
     crawl_id TEXT PRIMARY KEY,
     seeds_json TEXT NOT NULL,
     follow_links INTEGER NOT NULL,
+    same_domain INTEGER NOT NULL DEFAULT 1,
     max_pages INTEGER NOT NULL,
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL
@@ -37,6 +38,7 @@ class CrawlManifest:
     crawl_id: str
     seeds: tuple[str, ...]
     follow_links: bool
+    same_domain: bool
     max_pages: int
     created_at: float
     updated_at: float
@@ -53,6 +55,7 @@ class SQLiteCrawlStore:
         self._connection.execute("PRAGMA journal_mode=WAL")
         self._connection.execute("PRAGMA synchronous=NORMAL")
         self._connection.executescript(_SCHEMA)
+        self._migrate_manifest_schema()
         self._connection.commit()
         self._lock = asyncio.Lock()
         self._closed = False
@@ -63,6 +66,7 @@ class SQLiteCrawlStore:
         seeds: tuple[str, ...],
         *,
         follow_links: bool,
+        same_domain: bool,
         max_pages: int,
         now: float | None = None,
     ) -> CrawlManifest:
@@ -79,14 +83,15 @@ class SQLiteCrawlStore:
                 self._connection.execute(
                     """
                     INSERT INTO crawl_manifests (
-                        crawl_id, seeds_json, follow_links, max_pages,
+                        crawl_id, seeds_json, follow_links, same_domain, max_pages,
                         created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         crawl_id,
                         json.dumps(seeds, ensure_ascii=False),
                         int(follow_links),
+                        int(same_domain),
                         max_pages,
                         current,
                         current,
@@ -99,6 +104,7 @@ class SQLiteCrawlStore:
             crawl_id=crawl_id,
             seeds=seeds,
             follow_links=follow_links,
+            same_domain=same_domain,
             max_pages=max_pages,
             created_at=current,
             updated_at=current,
@@ -185,6 +191,16 @@ class SQLiteCrawlStore:
             self._connection.close()
             self._closed = True
 
+    def _migrate_manifest_schema(self) -> None:
+        columns = {
+            str(row["name"])
+            for row in self._connection.execute("PRAGMA table_info(crawl_manifests)")
+        }
+        if "same_domain" not in columns:
+            self._connection.execute(
+                "ALTER TABLE crawl_manifests ADD COLUMN same_domain INTEGER NOT NULL DEFAULT 1"
+            )
+
     def _ensure_open(self) -> None:
         if self._closed:
             raise RuntimeError("SQLiteCrawlStore is closed")
@@ -198,6 +214,7 @@ def _manifest_from_row(row: sqlite3.Row) -> CrawlManifest:
         crawl_id=str(row["crawl_id"]),
         seeds=tuple(seeds),
         follow_links=bool(row["follow_links"]),
+        same_domain=bool(row["same_domain"]),
         max_pages=int(row["max_pages"]),
         created_at=float(row["created_at"]),
         updated_at=float(row["updated_at"]),
