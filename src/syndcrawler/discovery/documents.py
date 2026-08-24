@@ -3,8 +3,8 @@ from __future__ import annotations
 import gzip
 import io
 from dataclasses import dataclass
-from xml.etree import ElementTree
 from urllib.parse import urljoin
+from xml.etree import ElementTree
 
 from syndcrawler.core.url import canonicalize_url
 
@@ -109,10 +109,7 @@ def parse_feed(
 def parse_robots_sitemaps(text: bytes | str, source_url: str) -> tuple[str, ...]:
     """Extract Sitemap directives from robots.txt without interpreting allow/disallow rules."""
 
-    if isinstance(text, bytes):
-        value = text.decode("utf-8", errors="replace")
-    else:
-        value = text
+    value = text.decode("utf-8", errors="replace") if isinstance(text, bytes) else text
     urls: list[str] = []
     for raw_line in value.splitlines():
         line = raw_line.split("#", 1)[0].strip()
