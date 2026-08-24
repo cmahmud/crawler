@@ -7,7 +7,7 @@
   "scripts": {
     "dev": "bun run src/index.tsx",
     "typecheck": "tsc --noEmit",
-    "test": "bun test src/api.test.ts",
+    "test": "bun test src/*.test.ts",
     "check": "bun run typecheck && bun run test",
     "build": "mkdir -p dist && bun build --compile src/index.tsx --outfile dist/syndcrawler-tui"
   },
