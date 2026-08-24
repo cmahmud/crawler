@@ -52,3 +52,28 @@ async def test_queue_policy_enforces_concurrency_and_delay() -> None:
     await frontier.ack(first[0])
     assert await frontier.lease("default", now=101, lease_seconds=10) == []
     assert len(await frontier.lease("default", now=102, lease_seconds=10)) == 1
+
+
+@pytest.mark.asyncio
+async def test_crawl_limit_counts_unique_first_leases_not_retries() -> None:
+    frontier = MemoryFrontier()
+    await frontier.set_crawl_limit("limited", 2)
+    await frontier.add(
+        FrontierRequest("https://a.example/page", crawl_id="limited"),
+        FrontierRequest("https://b.example/page", crawl_id="limited"),
+        FrontierRequest("https://c.example/page", crawl_id="limited"),
+    )
+
+    first = await frontier.lease("limited", limit=2, now=100, lease_seconds=10)
+    assert len(first) == 2
+    await frontier.retry(first[0], available_at=100, error="temporary")
+    await frontier.ack(first[1])
+
+    retry = await frontier.lease("limited", limit=2, now=100, lease_seconds=10)
+    assert len(retry) == 1
+    assert retry[0].request.url == first[0].request.url
+    assert retry[0].attempt == 2
+    await frontier.ack(retry[0])
+
+    assert await frontier.lease("limited", limit=2, now=100, lease_seconds=10) == []
+    assert (await frontier.stats("limited"))["queued"] == 1
