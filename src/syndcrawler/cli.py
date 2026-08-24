@@ -37,6 +37,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="optional durable crawl ID; generated automatically when omitted",
     )
     _add_state_dir_flag(crawl)
+    _add_discovery_flags(crawl)
     _add_fetch_flags(crawl)
 
     resume = subparsers.add_parser(
@@ -107,6 +108,10 @@ def _config_from_args(args: argparse.Namespace) -> CrawlConfig:
         allow_private_networks=args.allow_private_networks,
         proxy_urls=tuple(args.proxy),
         proxy_mode=ProxyMode(args.proxy_mode),
+        sitemap_discovery_enabled=not getattr(args, "no_sitemap_discovery", False),
+        sitemap_max_documents=getattr(args, "sitemap_max_documents", 32),
+        sitemap_max_depth=getattr(args, "sitemap_max_depth", 4),
+        sitemap_max_urls=getattr(args, "sitemap_max_urls", 10_000),
         browser_enabled=args.browser,
         browser_type=args.browser_type,
         browser_executable_path=(
@@ -137,6 +142,17 @@ def _add_state_dir_flag(parser: argparse.ArgumentParser) -> None:
         default=".syndcrawler",
         help="directory for durable crawl SQLite state",
     )
+
+
+def _add_discovery_flags(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--no-sitemap-discovery",
+        action="store_true",
+        help="do not seed the durable frontier from robots.txt/sitemaps",
+    )
+    parser.add_argument("--sitemap-max-documents", type=int, default=32)
+    parser.add_argument("--sitemap-max-depth", type=int, default=4)
+    parser.add_argument("--sitemap-max-urls", type=int, default=10_000)
 
 
 def _add_fetch_flags(parser: argparse.ArgumentParser) -> None:
