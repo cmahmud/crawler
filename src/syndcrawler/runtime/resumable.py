@@ -2,18 +2,18 @@ from __future__ import annotations
 
 import json
 import re
-import time
 import uuid
 from dataclasses import dataclass, replace
 from pathlib import Path
 
 from syndcrawler.config import CrawlConfig
+from syndcrawler.core.change import ChangeAssessment
 from syndcrawler.core.frontier import FrontierRequest
 from syndcrawler.core.recrawl import RecrawlPolicy
-from syndcrawler.core.url import canonicalize_url
 from syndcrawler.discovery import SitemapDiscoveryClient
 from syndcrawler.models import PageRecord
 from syndcrawler.runtime.local import LocalCrawler
+from syndcrawler.runtime.worker import CrawlWorker
 from syndcrawler.storage import CrawlManifest, SQLiteCrawlStore, SQLiteFrontier
 
 _CRAWL_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
@@ -32,9 +32,9 @@ class CrawlRunResult:
 class ResumableCrawler:
     """Crash-resumable local crawl coordinator backed by SQLite.
 
-    SQLite is the source of truth for work state. Crawlee remains the bounded batch
-    fetch engine, so HTTP autoscaling, browser escalation and network-route policy
-    stay identical to ordinary local crawls.
+    SQLite is the source of truth for local work state. Fetch/persist/discovery
+    batches run through the same storage-neutral `CrawlWorker` contract that
+    server deployments can pair with a Redis frontier and shared result store.
     """
 
     def __init__(
@@ -207,6 +207,39 @@ class ResumableCrawler:
         fetcher: LocalCrawler,
         manifest: CrawlManifest,
     ) -> None:
+        async def schedule_recrawl(
+            request_url: str,
+            _record: PageRecord,
+            assessment: ChangeAssessment | None,
+            observed_at: float,
+        ) -> None:
+            if assessment is None:
+                return
+            state = await store.get_resource_state(manifest.crawl_id, request_url)
+            previous_interval = state.recrawl_interval_seconds if state is not None else None
+            interval, next_fetch_at = self.recrawl_policy.next_fetch_at(
+                observed_at,
+                assessment.kind,
+                previous_interval,
+            )
+            await store.schedule_resource(
+                manifest.crawl_id,
+                request_url,
+                interval_seconds=interval,
+                next_fetch_at=next_fetch_at,
+            )
+
+        worker = CrawlWorker(
+            frontier,
+            store,
+            fetcher,
+            on_persisted=schedule_recrawl,
+        )
+        lease_seconds = max(
+            60.0,
+            self.config.browser_navigation_timeout_seconds + 30.0,
+        )
+
         while True:
             stats = await frontier.stats(manifest.crawl_id)
             terminal = stats["done"] + stats["failed"]
@@ -214,90 +247,16 @@ class ResumableCrawler:
             if remaining <= 0:
                 return
 
-            leases = await frontier.lease(
+            batch = await worker.run_batch(
                 manifest.crawl_id,
+                scope_urls=manifest.seeds,
+                follow_links=manifest.follow_links,
                 limit=min(self.config.max_concurrency, remaining),
-                lease_seconds=max(
-                    60.0,
-                    self.config.browser_navigation_timeout_seconds + 30.0,
-                ),
+                lease_seconds=lease_seconds,
+                namespace_prefix="durable",
             )
-            if not leases:
+            if batch.idle:
                 return
-
-            namespace = f"durable:{manifest.crawl_id}:{uuid.uuid4().hex}"
-            batch = await fetcher.crawl(
-                [lease.request.url for lease in leases],
-                follow_links=False,
-                max_pages=len(leases),
-                scope_urls=list(manifest.seeds),
-                request_namespace=namespace,
-            )
-            by_request_url = _index_records(batch)
-
-            for lease in leases:
-                record = by_request_url.get(lease.request.url)
-                if record is None:
-                    await frontier.fail(
-                        lease,
-                        error="fetch batch produced no PageRecord",
-                    )
-                    continue
-
-                observed_at = time.time()
-                assessment = await store.put_result(
-                    manifest.crawl_id,
-                    lease.request.url,
-                    record,
-                    now=observed_at,
-                )
-                if assessment is not None:
-                    state = await store.get_resource_state(
-                        manifest.crawl_id,
-                        lease.request.url,
-                    )
-                    previous_interval = (
-                        state.recrawl_interval_seconds if state is not None else None
-                    )
-                    interval, next_fetch_at = self.recrawl_policy.next_fetch_at(
-                        observed_at,
-                        assessment.kind,
-                        previous_interval,
-                    )
-                    await store.schedule_resource(
-                        manifest.crawl_id,
-                        lease.request.url,
-                        interval_seconds=interval,
-                        next_fetch_at=next_fetch_at,
-                    )
-                if manifest.follow_links:
-                    await frontier.add(
-                        *(
-                            FrontierRequest(
-                                link,
-                                crawl_id=manifest.crawl_id,
-                                depth=lease.request.depth + 1,
-                                metadata={"discovered_from": lease.request.url},
-                            )
-                            for link in record.links
-                        )
-                    )
-                await frontier.ack(lease)
-
-
-def _index_records(records: list[PageRecord]) -> dict[str, PageRecord]:
-    indexed: dict[str, PageRecord] = {}
-    for record in records:
-        requested = record.metadata.get("requested_url")
-        candidates = [requested, record.url]
-        for candidate in candidates:
-            if not isinstance(candidate, str):
-                continue
-            try:
-                indexed.setdefault(canonicalize_url(candidate), record)
-            except (ValueError, UnicodeError):
-                continue
-    return indexed
 
 
 def _is_complete(stats: dict[str, int], max_pages: int) -> bool:
