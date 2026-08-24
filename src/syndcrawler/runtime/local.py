@@ -36,6 +36,8 @@ class LocalCrawler:
         *,
         follow_links: bool = True,
         max_pages: int | None = None,
+        scope_urls: list[str] | None = None,
+        request_namespace: str | None = None,
     ) -> list[PageRecord]:
         from crawlee import ConcurrencySettings, Request
         from crawlee.crawlers import BasicCrawlingContext, HttpCrawler, HttpCrawlingContext
@@ -44,7 +46,9 @@ class LocalCrawler:
 
         limit = max_pages or self.config.max_pages
         safe_seeds = [await self.egress.validate(seed) for seed in seeds]
-        seed_hosts = tuple(safe_seeds)
+        raw_scope = scope_urls if scope_urls is not None else seeds
+        safe_scope = [await self.egress.validate(url) for url in raw_scope]
+        seed_hosts = tuple(safe_scope)
         records: list[PageRecord] = []
         browser_candidates: dict[str, PageRecord] = {}
 
@@ -155,7 +159,13 @@ class LocalCrawler:
             requests = []
             for link in links:
                 try:
-                    requests.append(Request.from_url(link))
+                    requests.append(
+                        _request_from_url(
+                            Request,
+                            link,
+                            request_namespace=request_namespace,
+                        )
+                    )
                 except ValidationError:
                     context.log.debug(f"Skipping invalid URL: {link}")
             if requests:
@@ -175,7 +185,15 @@ class LocalCrawler:
                 f"Request failed after retries: {context.request.url}: {error}"
             )
 
-        await crawler.run(safe_seeds)
+        initial_requests = [
+            _request_from_url(
+                Request,
+                url,
+                request_namespace=request_namespace,
+            )
+            for url in safe_seeds
+        ]
+        await crawler.run(initial_requests)
 
         if browser_candidates:
             renderer = BrowserRenderer(
@@ -197,6 +215,13 @@ class LocalCrawler:
                             metadata={
                                 **static_record.metadata,
                                 **browser_record.metadata,
+                                "requested_url": static_record.metadata.get(
+                                    "requested_url",
+                                    browser_record.metadata.get("requested_url"),
+                                ),
+                                "browser_requested_url": browser_record.metadata.get(
+                                    "requested_url"
+                                ),
                                 "escalated_from": "http",
                             },
                         )
@@ -236,6 +261,12 @@ class LocalCrawler:
             except UnsafeTargetError:
                 continue
         return safe
+
+
+def _request_from_url(Request, url: str, *, request_namespace: str | None):
+    if request_namespace is None:
+        return Request.from_url(url)
+    return Request.from_url(url, unique_key=f"{request_namespace}:{url}")
 
 
 def _write_records(path: Path, records: list[PageRecord]) -> None:
