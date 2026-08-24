@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import json
 import re
+import time
 import uuid
 from dataclasses import dataclass, replace
 from pathlib import Path
 
 from syndcrawler.config import CrawlConfig
 from syndcrawler.core.frontier import FrontierRequest
+from syndcrawler.core.recrawl import RecrawlPolicy
 from syndcrawler.core.url import canonicalize_url
 from syndcrawler.discovery import SitemapDiscoveryClient
 from syndcrawler.models import PageRecord
@@ -40,9 +42,11 @@ class ResumableCrawler:
         config: CrawlConfig | None = None,
         *,
         state_dir: str | Path = ".syndcrawler",
+        recrawl_policy: RecrawlPolicy | None = None,
     ) -> None:
         self.config = config or CrawlConfig()
         self.state_dir = Path(state_dir)
+        self.recrawl_policy = recrawl_policy or RecrawlPolicy()
 
     async def start(
         self,
@@ -240,11 +244,32 @@ class ResumableCrawler:
                     )
                     continue
 
-                await store.put_result(
+                observed_at = time.time()
+                assessment = await store.put_result(
                     manifest.crawl_id,
                     lease.request.url,
                     record,
+                    now=observed_at,
                 )
+                if assessment is not None:
+                    state = await store.get_resource_state(
+                        manifest.crawl_id,
+                        lease.request.url,
+                    )
+                    previous_interval = (
+                        state.recrawl_interval_seconds if state is not None else None
+                    )
+                    interval, next_fetch_at = self.recrawl_policy.next_fetch_at(
+                        observed_at,
+                        assessment.kind,
+                        previous_interval,
+                    )
+                    await store.schedule_resource(
+                        manifest.crawl_id,
+                        lease.request.url,
+                        interval_seconds=interval,
+                        next_fetch_at=next_fetch_at,
+                    )
                 if manifest.follow_links:
                     await frontier.add(
                         *(
