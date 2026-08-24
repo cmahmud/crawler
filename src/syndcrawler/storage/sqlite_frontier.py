@@ -51,14 +51,21 @@ CREATE TABLE IF NOT EXISTS frontier_queues (
     next_allowed_at REAL NOT NULL DEFAULT 0,
     PRIMARY KEY(crawl_id, queue_key)
 );
+
+CREATE TABLE IF NOT EXISTS frontier_crawls (
+    crawl_id TEXT PRIMARY KEY,
+    crawl_limit INTEGER,
+    issued INTEGER NOT NULL DEFAULT 0
+);
 """
 
 
 class SQLiteFrontier:
     """Durable local frontier implementing the same contract as MemoryFrontier.
 
-    The backend uses only the Python standard library. Every state transition that
-    changes a request and its host-affine queue runtime is committed atomically.
+    Every request/queue/crawl-budget transition is committed atomically. A crawl's
+    global budget counts unique URLs when they receive their first lease; retries
+    and reclaimed stale leases do not consume additional budget.
     """
 
     def __init__(self, path: str | Path) -> None:
@@ -90,6 +97,7 @@ class SQLiteFrontier:
                 for raw in requests:
                     request = raw.normalized()
                     assert request.queue_key is not None
+                    self._ensure_crawl(request.crawl_id)
                     cursor = self._connection.execute(
                         """
                         INSERT OR IGNORE INTO frontier_requests (
@@ -116,6 +124,26 @@ class SQLiteFrontier:
                 raise
             return added
 
+    async def set_crawl_limit(self, crawl_id: str, limit: int | None) -> None:
+        if limit is not None and limit <= 0:
+            raise ValueError("crawl limit must be positive")
+        async with self._lock:
+            self._ensure_open()
+            self._connection.execute("BEGIN IMMEDIATE")
+            try:
+                self._ensure_crawl(crawl_id)
+                self._connection.execute(
+                    """
+                    UPDATE frontier_crawls SET crawl_limit = ?
+                    WHERE crawl_id = ?
+                    """,
+                    (limit, crawl_id),
+                )
+                self._connection.commit()
+            except Exception:
+                self._connection.rollback()
+                raise
+
     async def set_queue_policy(
         self,
         crawl_id: str,
@@ -127,6 +155,7 @@ class SQLiteFrontier:
             self._ensure_open()
             self._connection.execute("BEGIN IMMEDIATE")
             try:
+                self._ensure_crawl(crawl_id)
                 self._ensure_queue(crawl_id, queue_key)
                 self._connection.execute(
                     """
@@ -167,6 +196,7 @@ class SQLiteFrontier:
             self._ensure_open()
             self._connection.execute("BEGIN IMMEDIATE")
             try:
+                self._ensure_crawl(crawl_id)
                 self._reclaim_expired(crawl_id, current)
                 rows = self._connection.execute(
                     """
@@ -177,6 +207,9 @@ class SQLiteFrontier:
                     (crawl_id, RequestState.QUEUED.value, current),
                 ).fetchall()
 
+                crawl_runtime = self._crawl_row(crawl_id)
+                global_limit = crawl_runtime["crawl_limit"]
+                global_issued = int(crawl_runtime["issued"])
                 leases: list[FrontierLease] = []
                 for row in rows:
                     if len(leases) >= limit:
@@ -192,10 +225,18 @@ class SQLiteFrontier:
                     if crawl_limit is not None and queue["issued"] >= crawl_limit:
                         continue
 
+                    first_lease = int(row["attempt"]) == 0
+                    if (
+                        first_lease
+                        and global_limit is not None
+                        and global_issued >= int(global_limit)
+                    ):
+                        continue
+
                     token = uuid.uuid4().hex
                     attempt = int(row["attempt"]) + 1
                     expires_at = current + lease_seconds
-                    self._connection.execute(
+                    cursor = self._connection.execute(
                         """
                         UPDATE frontier_requests
                         SET state = ?, attempt = ?, lease_token = ?,
@@ -211,6 +252,9 @@ class SQLiteFrontier:
                             RequestState.QUEUED.value,
                         ),
                     )
+                    if cursor.rowcount != 1:
+                        continue
+
                     next_allowed_at = float(queue["next_allowed_at"])
                     if queue["delay_seconds"]:
                         next_allowed_at = current + float(queue["delay_seconds"])
@@ -223,6 +267,16 @@ class SQLiteFrontier:
                         """,
                         (next_allowed_at, crawl_id, row["queue_key"]),
                     )
+                    if first_lease:
+                        global_issued += 1
+                        self._connection.execute(
+                            """
+                            UPDATE frontier_crawls SET issued = ?
+                            WHERE crawl_id = ?
+                            """,
+                            (global_issued, crawl_id),
+                        )
+
                     request = _request_from_row(row)
                     leases.append(
                         FrontierLease(
@@ -371,6 +425,26 @@ class SQLiteFrontier:
             """,
             (crawl_id, queue_key),
         )
+
+    def _ensure_crawl(self, crawl_id: str) -> None:
+        self._connection.execute(
+            """
+            INSERT OR IGNORE INTO frontier_crawls (crawl_id, issued)
+            SELECT ?, COUNT(*)
+            FROM frontier_requests
+            WHERE crawl_id = ? AND attempt > 0
+            """,
+            (crawl_id, crawl_id),
+        )
+
+    def _crawl_row(self, crawl_id: str) -> sqlite3.Row:
+        self._ensure_crawl(crawl_id)
+        row = self._connection.execute(
+            "SELECT * FROM frontier_crawls WHERE crawl_id = ?",
+            (crawl_id,),
+        ).fetchone()
+        assert row is not None
+        return row
 
     def _ensure_queue(self, crawl_id: str, queue_key: str) -> None:
         self._connection.execute(
