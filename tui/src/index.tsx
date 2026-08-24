@@ -12,6 +12,12 @@ import {
   type Health,
   SyndCrawlerApi,
 } from "./api";
+import {
+  activeFrame,
+  flowFrame,
+  reducedMotionFromEnv,
+  revealText,
+} from "./motion";
 
 type View = "dashboard" | "detail" | "new" | "help";
 
@@ -69,7 +75,18 @@ function HealthPill({ label, ok }: { label: string; ok: boolean | undefined }) {
   );
 }
 
-function Header({ health, apiUrl }: { health: Health | null; apiUrl: string }) {
+function Header({
+  health,
+  apiUrl,
+  motionTick,
+  reducedMotion,
+}: {
+  health: Health | null;
+  apiUrl: string;
+  motionTick: number;
+  reducedMotion: boolean;
+}) {
+  const title = revealText("SyndCrawler", motionTick + 1, reducedMotion);
   return (
     <box
       border
@@ -84,7 +101,7 @@ function Header({ health, apiUrl }: { health: Health | null; apiUrl: string }) {
       <box flexDirection="row" justifyContent="space-between">
         <text>
           <span fg={palette.accent}>◆</span>
-          <strong> SyndCrawler</strong>
+          <strong> {title}</strong>
           <span fg={palette.muted}> operator console</span>
         </text>
         <text fg={palette.muted}>{apiUrl}</text>
@@ -94,8 +111,8 @@ function Header({ health, apiUrl }: { health: Health | null; apiUrl: string }) {
         <HealthPill label="Postgres" ok={health?.postgres} />
         <HealthPill label="Redis" ok={health?.redis} />
         <text>
-          <span fg={palette.good}>●</span>
-          <span fg={palette.muted}> worker via control plane</span>
+          <span fg={palette.accent}>{flowFrame(motionTick, reducedMotion)}</span>
+          <span fg={palette.muted}> fetch · parse · store</span>
         </text>
       </box>
     </box>
@@ -107,11 +124,15 @@ function Dashboard({
   selectedIndex,
   narrow,
   loading,
+  motionTick,
+  reducedMotion,
 }: {
   crawls: CrawlStatus[];
   selectedIndex: number;
   narrow: boolean;
   loading: boolean;
+  motionTick: number;
+  reducedMotion: boolean;
 }) {
   return (
     <box
@@ -136,14 +157,17 @@ function Dashboard({
           <box flexDirection="row" backgroundColor={palette.panelAlt} paddingLeft={1}>
             <text fg={palette.muted}>
               {narrow
-                ? "  CRAWL                         STATE     DONE FAIL"
-                : "  CRAWL                                  STATE       DONE  QUEUE LEASE FAIL"}
+                ? "   CRAWL                        STATE     DONE FAIL"
+                : "   CRAWL                                 STATE       DONE  QUEUE LEASE FAIL"}
             </text>
           </box>
           {crawls.map((crawl, index) => {
             const selected = index === selectedIndex;
-            const prefix = selected ? "›" : " ";
-            const idWidth = narrow ? 28 : 38;
+            const cursor = selected ? "›" : " ";
+            const activity = crawl.lifecycle === "active"
+              ? activeFrame(motionTick + index, reducedMotion)
+              : "·";
+            const idWidth = narrow ? 27 : 37;
             const id = crawl.crawl_id.length > idWidth
               ? `${crawl.crawl_id.slice(0, idWidth - 1)}…`
               : crawl.crawl_id.padEnd(idWidth);
@@ -152,7 +176,8 @@ function Dashboard({
             return (
               <box key={crawl.crawl_id} backgroundColor={rowBg} paddingLeft={1}>
                 <text>
-                  <span fg={selected ? palette.accent : palette.muted}>{prefix} </span>
+                  <span fg={selected ? palette.accent : palette.muted}>{cursor}</span>
+                  <span fg={lifecycleColor(crawl.lifecycle)}>{activity} </span>
                   <span fg={selected ? palette.text : "#b8c5dc"}>{id} </span>
                   <span fg={lifecycleColor(crawl.lifecycle)}>{state}</span>
                   <span fg={palette.text}>{String(crawl.stats.done).padStart(5)}</span>
@@ -179,10 +204,14 @@ function Detail({
   crawl,
   results,
   narrow,
+  motionTick,
+  reducedMotion,
 }: {
   crawl: CrawlStatus | null;
   results: CrawlResultsPage | null;
   narrow: boolean;
+  motionTick: number;
+  reducedMotion: boolean;
 }) {
   if (!crawl) {
     return (
@@ -193,6 +222,9 @@ function Detail({
   }
 
   const visible = results?.items.slice(0, narrow ? 8 : 14) ?? [];
+  const activity = crawl.lifecycle === "active"
+    ? activeFrame(motionTick, reducedMotion)
+    : "●";
   return (
     <box flexGrow={1} flexDirection="column" gap={1}>
       <box
@@ -208,6 +240,7 @@ function Detail({
         flexDirection="column"
       >
         <text>
+          <span fg={lifecycleColor(crawl.lifecycle)}>{activity} </span>
           <span fg={palette.muted}>state </span>
           <span fg={lifecycleColor(crawl.lifecycle)}>{crawl.lifecycle}</span>
           <span fg={palette.muted}>   results </span>
@@ -342,7 +375,7 @@ function Help() {
         borderColor={palette.border}
         backgroundColor={palette.panel}
         width={54}
-        height={16}
+        height={17}
         padding={1}
         flexDirection="column"
       >
@@ -355,6 +388,7 @@ function Help() {
         <text><span fg={palette.accent}>Esc</span>    back</text>
         <text><span fg={palette.accent}>?</span>      this help</text>
         <text><span fg={palette.accent}>q</span>      quit dashboard</text>
+        <text fg={palette.muted}>Set SYNCRAWLER_TUI_REDUCED_MOTION=true for static motion.</text>
       </box>
     </box>
   );
@@ -377,8 +411,10 @@ function Footer({ message, error, view }: { message: string; error: string; view
 
 function App() {
   const api = useMemo(() => new SyndCrawlerApi(), []);
+  const reducedMotion = useMemo(() => reducedMotionFromEnv(), []);
   const { width } = useTerminalDimensions();
   const narrow = width < 100;
+  const [motionTick, setMotionTick] = useState(0);
   const [view, setView] = useState<View>("dashboard");
   const [health, setHealth] = useState<Health | null>(null);
   const [crawls, setCrawls] = useState<CrawlStatus[]>([]);
@@ -431,6 +467,14 @@ function App() {
       flash(safeError(nextError), true);
     }
   }, [api, flash]);
+
+  useEffect(() => {
+    if (reducedMotion) return;
+    const timer = setInterval(() => {
+      setMotionTick((current) => current + 1);
+    }, 140);
+    return () => clearInterval(timer);
+  }, [reducedMotion]);
 
   useEffect(() => {
     void refreshDashboard();
@@ -570,16 +614,31 @@ function App() {
       padding={1}
       gap={1}
     >
-      <Header health={health} apiUrl={api.baseUrl} />
+      <Header
+        health={health}
+        apiUrl={api.baseUrl}
+        motionTick={motionTick}
+        reducedMotion={reducedMotion}
+      />
       {view === "dashboard" && (
         <Dashboard
           crawls={crawls}
           selectedIndex={selectedIndex}
           narrow={narrow}
           loading={loading}
+          motionTick={motionTick}
+          reducedMotion={reducedMotion}
         />
       )}
-      {view === "detail" && <Detail crawl={detail} results={results} narrow={narrow} />}
+      {view === "detail" && (
+        <Detail
+          crawl={detail}
+          results={results}
+          narrow={narrow}
+          motionTick={motionTick}
+          reducedMotion={reducedMotion}
+        />
+      )}
       {view === "new" && (
         <NewCrawl
           form={form}
