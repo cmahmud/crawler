@@ -13,6 +13,15 @@ _JS_REQUIRED_PHRASES = (
     "requires javascript",
     "please turn on javascript",
 )
+_DYNAMIC_CONTAINER_TOKENS = (
+    "placeholder",
+    "skeleton",
+    "loading",
+    "spinner",
+    "results-root",
+    "items-root",
+    "content-root",
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -43,6 +52,7 @@ def assess_rendering(html: bytes | str) -> RenderingAssessment:
     scripts = parser.css("script")
     script_count = len(scripts)
     app_root = any(parser.css_first(selector) is not None for selector in _APP_ROOT_SELECTORS)
+    dynamic_placeholder = _has_dynamic_placeholder(parser)
 
     noscript_text = " ".join(
         node.text(separator=" ", strip=True).lower() for node in parser.css("noscript")
@@ -62,6 +72,10 @@ def assess_rendering(html: bytes | str) -> RenderingAssessment:
     if app_root:
         score += 2
         reasons.append("client-app-root")
+
+    if dynamic_placeholder and visible_text_length < 300 and script_count > 0:
+        score += 3
+        reasons.append("dynamic-content-placeholder")
 
     if js_required:
         score += 3
@@ -83,3 +97,20 @@ def assess_rendering(html: bytes | str) -> RenderingAssessment:
         script_count=script_count,
         reasons=tuple(reasons),
     )
+
+
+def _has_dynamic_placeholder(parser: LexborHTMLParser) -> bool:
+    """Detect empty/near-empty containers that are likely populated by JavaScript."""
+
+    for node in parser.css("[id], [class]"):
+        attributes = node.attributes
+        marker = " ".join(
+            value.lower()
+            for key, value in attributes.items()
+            if key in {"id", "class"} and isinstance(value, str)
+        )
+        if not marker or not any(token in marker for token in _DYNAMIC_CONTAINER_TOKENS):
+            continue
+        if len(node.text(separator=" ", strip=True)) < 40:
+            return True
+    return False
