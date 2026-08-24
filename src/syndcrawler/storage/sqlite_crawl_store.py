@@ -50,11 +50,16 @@ CREATE TABLE IF NOT EXISTS crawl_resource_state (
     last_changed_at REAL NOT NULL,
     change_count INTEGER NOT NULL DEFAULT 0,
     last_change_kind TEXT NOT NULL,
+    recrawl_interval_seconds REAL,
+    next_fetch_at REAL,
     PRIMARY KEY(crawl_id, request_url)
 );
 
 CREATE INDEX IF NOT EXISTS idx_crawl_resource_state_seen
 ON crawl_resource_state(crawl_id, last_seen_at, request_url);
+
+CREATE INDEX IF NOT EXISTS idx_crawl_resource_state_due
+ON crawl_resource_state(crawl_id, next_fetch_at, request_url);
 """
 
 
@@ -79,6 +84,8 @@ class ResourceState:
     last_changed_at: float
     change_count: int
     last_change_kind: ChangeKind
+    recrawl_interval_seconds: float | None
+    next_fetch_at: float | None
 
 
 class SQLiteCrawlStore:
@@ -93,6 +100,7 @@ class SQLiteCrawlStore:
         self._connection.execute("PRAGMA synchronous=NORMAL")
         self._connection.executescript(_SCHEMA)
         self._migrate_manifest_schema()
+        self._migrate_resource_schema()
         self._connection.commit()
         self._lock = asyncio.Lock()
         self._closed = False
@@ -277,6 +285,33 @@ class SQLiteCrawlStore:
         assert state is not None
         return state
 
+    async def schedule_resource(
+        self,
+        crawl_id: str,
+        request_url: str,
+        *,
+        interval_seconds: float,
+        next_fetch_at: float,
+    ) -> ResourceState:
+        if interval_seconds <= 0:
+            raise ValueError("interval_seconds must be positive")
+        async with self._lock:
+            self._ensure_open()
+            cursor = self._connection.execute(
+                """
+                UPDATE crawl_resource_state
+                SET recrawl_interval_seconds = ?, next_fetch_at = ?
+                WHERE crawl_id = ? AND request_url = ?
+                """,
+                (interval_seconds, next_fetch_at, crawl_id, request_url),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError(f"resource state does not exist: {request_url}")
+            self._connection.commit()
+        state = await self.get_resource_state(crawl_id, request_url)
+        assert state is not None
+        return state
+
     async def get_resource_state(
         self,
         crawl_id: str,
@@ -303,6 +338,31 @@ class SQLiteCrawlStore:
                 ORDER BY last_seen_at ASC, request_url ASC
                 """,
                 (crawl_id,),
+            ).fetchall()
+        return [_resource_state_from_row(row) for row in rows]
+
+    async def due_resources(
+        self,
+        crawl_id: str,
+        *,
+        now: float | None = None,
+        limit: int = 100,
+    ) -> list[ResourceState]:
+        if limit <= 0:
+            raise ValueError("limit must be positive")
+        current = time.time() if now is None else now
+        async with self._lock:
+            self._ensure_open()
+            rows = self._connection.execute(
+                """
+                SELECT * FROM crawl_resource_state
+                WHERE crawl_id = ?
+                  AND next_fetch_at IS NOT NULL
+                  AND next_fetch_at <= ?
+                ORDER BY next_fetch_at ASC, request_url ASC
+                LIMIT ?
+                """,
+                (crawl_id, current, limit),
             ).fetchall()
         return [_resource_state_from_row(row) for row in rows]
 
@@ -347,22 +407,18 @@ class SQLiteCrawlStore:
     ) -> None:
         first_seen = previous.first_seen_at if previous is not None else current
         changed = assessment.changed
-        last_changed = (
-            current
-            if previous is None or changed
-            else previous.last_changed_at
-        )
-        change_count = (
-            (previous.change_count if previous is not None else 0)
-            + int(changed)
-        )
+        last_changed = current if previous is None or changed else previous.last_changed_at
+        change_count = (previous.change_count if previous is not None else 0) + int(changed)
+        interval = previous.recrawl_interval_seconds if previous is not None else None
+        next_fetch = previous.next_fetch_at if previous is not None else None
         self._connection.execute(
             """
             INSERT INTO crawl_resource_state (
                 crawl_id, request_url, etag, last_modified, content_sha256,
                 semantic_sha256, first_seen_at, last_seen_at, last_changed_at,
-                change_count, last_change_kind
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                change_count, last_change_kind, recrawl_interval_seconds,
+                next_fetch_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(crawl_id, request_url) DO UPDATE SET
                 etag = excluded.etag,
                 last_modified = excluded.last_modified,
@@ -371,7 +427,9 @@ class SQLiteCrawlStore:
                 last_seen_at = excluded.last_seen_at,
                 last_changed_at = excluded.last_changed_at,
                 change_count = excluded.change_count,
-                last_change_kind = excluded.last_change_kind
+                last_change_kind = excluded.last_change_kind,
+                recrawl_interval_seconds = excluded.recrawl_interval_seconds,
+                next_fetch_at = excluded.next_fetch_at
             """,
             (
                 crawl_id,
@@ -385,6 +443,8 @@ class SQLiteCrawlStore:
                 last_changed,
                 change_count,
                 assessment.kind.value,
+                interval,
+                next_fetch,
             ),
         )
 
@@ -396,6 +456,20 @@ class SQLiteCrawlStore:
         if "same_domain" not in columns:
             self._connection.execute(
                 "ALTER TABLE crawl_manifests ADD COLUMN same_domain INTEGER NOT NULL DEFAULT 1"
+            )
+
+    def _migrate_resource_schema(self) -> None:
+        columns = {
+            str(row["name"])
+            for row in self._connection.execute("PRAGMA table_info(crawl_resource_state)")
+        }
+        if "recrawl_interval_seconds" not in columns:
+            self._connection.execute(
+                "ALTER TABLE crawl_resource_state ADD COLUMN recrawl_interval_seconds REAL"
+            )
+        if "next_fetch_at" not in columns:
+            self._connection.execute(
+                "ALTER TABLE crawl_resource_state ADD COLUMN next_fetch_at REAL"
             )
 
     def _ensure_open(self) -> None:
@@ -439,6 +513,16 @@ def _resource_state_from_row(row: sqlite3.Row) -> ResourceState:
         last_changed_at=float(row["last_changed_at"]),
         change_count=int(row["change_count"]),
         last_change_kind=ChangeKind(str(row["last_change_kind"])),
+        recrawl_interval_seconds=(
+            float(row["recrawl_interval_seconds"])
+            if row["recrawl_interval_seconds"] is not None
+            else None
+        ),
+        next_fetch_at=(
+            float(row["next_fetch_at"])
+            if row["next_fetch_at"] is not None
+            else None
+        ),
     )
 
 
