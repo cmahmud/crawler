@@ -12,6 +12,20 @@ from syndcrawler.runtime import ResumableCrawler
 
 class _SiteHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
+        origin = f"http://{self.server.server_address[0]}:{self.server.server_address[1]}"
+        if self.path == "/robots.txt":
+            body = f"User-agent: *\nSitemap: {origin}/sitemap.xml\n"
+            self._send(200, body, "text/plain")
+            return
+        if self.path == "/sitemap.xml":
+            body = (
+                "<urlset>"
+                f"<url><loc>{origin}/hidden</loc></url>"
+                "</urlset>"
+            )
+            self._send(200, body, "application/xml")
+            return
+
         pages = {
             "/": (
                 "<html><head><title>Root</title></head><body>"
@@ -20,15 +34,26 @@ class _SiteHandler(BaseHTTPRequestHandler):
             ),
             "/a": "<html><head><title>A</title></head><body>A page</body></html>",
             "/b": "<html><head><title>B</title></head><body>B page</body></html>",
+            "/sitemap-only": (
+                "<html><head><title>Sitemap Seed</title></head>"
+                "<body>No links here.</body></html>"
+            ),
+            "/hidden": (
+                "<html><head><title>Hidden</title></head>"
+                "<body>Only listed in sitemap.</body></html>"
+            ),
         }
         body = pages.get(self.path)
         if body is None:
             self.send_response(404)
             self.end_headers()
             return
+        self._send(200, body, "text/html; charset=utf-8")
+
+    def _send(self, status: int, body: str, content_type: str) -> None:
         encoded = body.encode()
-        self.send_response(200)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(encoded)))
         self.end_headers()
         self.wfile.write(encoded)
@@ -63,6 +88,7 @@ async def test_resumable_crawl_persists_results_and_resume_is_idempotent(
             max_retries=0,
             respect_robots_txt=False,
             allow_private_networks=True,
+            sitemap_discovery_enabled=False,
         ),
         state_dir=tmp_path,
     )
@@ -84,6 +110,34 @@ async def test_resumable_crawl_persists_results_and_resume_is_idempotent(
     assert [record.to_dict() for record in second.records] == [
         record.to_dict() for record in first.records
     ]
+
+
+@pytest.mark.asyncio
+async def test_resumable_crawl_fetches_sitemap_only_url(
+    tmp_path: Path,
+    local_site: str,
+) -> None:
+    crawler = ResumableCrawler(
+        CrawlConfig(
+            max_pages=2,
+            max_concurrency=1,
+            max_retries=0,
+            respect_robots_txt=False,
+            allow_private_networks=True,
+            sitemap_discovery_enabled=True,
+        ),
+        state_dir=tmp_path,
+    )
+
+    result = await crawler.start(
+        [f"{local_site}sitemap-only"],
+        crawl_id="sitemap-seed-test",
+        max_pages=2,
+    )
+
+    assert result.completed is True
+    assert result.stats == {"queued": 0, "leased": 0, "done": 2, "failed": 0}
+    assert {record.title for record in result.records} == {"Sitemap Seed", "Hidden"}
 
 
 @pytest.mark.asyncio
