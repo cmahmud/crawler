@@ -73,6 +73,7 @@ async def test_http_shell_escalates_to_browser(dynamic_site: str) -> None:
             browser_type="chromium",
             browser_max_concurrency=1,
             browser_settle_seconds=0.15,
+            browser_chromium_sandbox=False,
         )
     )
 
