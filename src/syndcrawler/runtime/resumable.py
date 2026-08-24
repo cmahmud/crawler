@@ -78,6 +78,7 @@ class ResumableCrawler:
                 same_domain=self.config.same_domain,
                 max_pages=page_limit,
             )
+            await frontier.set_crawl_limit(crawl_id, page_limit)
             await frontier.add(
                 *(
                     FrontierRequest(
@@ -108,6 +109,7 @@ class ResumableCrawler:
             manifest = await store.get_manifest(crawl_id)
             if manifest is None:
                 raise ValueError(f"crawl manifest does not exist: {crawl_id}")
+            await frontier.set_crawl_limit(crawl_id, manifest.max_pages)
             fetcher = LocalCrawler(
                 replace(
                     self.config,
