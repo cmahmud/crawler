@@ -15,30 +15,27 @@ from syndcrawler.core.frontier import (
 if TYPE_CHECKING:
     from redis.asyncio import Redis
 
-_DEFAULT_QUEUE = {
-    "max_concurrency": 1,
-    "delay_seconds": 0.0,
-    "blocked_until": 0.0,
-    "active": 0,
-    "issued": 0,
-    "next_allowed_at": 0.0,
-}
-
 _ADD_SCRIPT = r"""
 local requests = cjson.decode(ARGV[1])
+local now = tonumber(ARGV[2])
 local added = 0
 for _, entry in ipairs(requests) do
     if redis.call('HEXISTS', KEYS[1], entry.url) == 0 then
-        entry.sequence = redis.call('INCR', KEYS[4])
+        entry.sequence = redis.call('INCR', KEYS[5])
+        entry.ready_member = string.format('%020d|%s', entry.sequence, entry.url)
         entry.state = 'queued'
         entry.attempt = 0
         entry.lease_token = cjson.null
         entry.lease_expires_at = 0
         entry.error = cjson.null
         redis.call('HSET', KEYS[1], entry.url, cjson.encode(entry))
-        redis.call('ZADD', KEYS[2], tonumber(entry.available_at), entry.url)
-        redis.call('HINCRBY', KEYS[5], 'queued', 1)
-        if redis.call('HEXISTS', KEYS[3], entry.queue_key) == 0 then
+        if tonumber(entry.available_at) <= now then
+            redis.call('ZADD', KEYS[2], -tonumber(entry.priority or 0), entry.ready_member)
+        else
+            redis.call('ZADD', KEYS[3], tonumber(entry.available_at), entry.url)
+        end
+        redis.call('HINCRBY', KEYS[6], 'queued', 1)
+        if redis.call('HEXISTS', KEYS[4], entry.queue_key) == 0 then
             local queue = {
                 max_concurrency = 1,
                 delay_seconds = 0,
@@ -47,7 +44,7 @@ for _, entry in ipairs(requests) do
                 issued = 0,
                 next_allowed_at = 0
             }
-            redis.call('HSET', KEYS[3], entry.queue_key, cjson.encode(queue))
+            redis.call('HSET', KEYS[4], entry.queue_key, cjson.encode(queue))
         end
         added = added + 1
     end
@@ -86,28 +83,55 @@ _LEASE_SCRIPT = r"""
 local now = tonumber(ARGV[1])
 local lease_seconds = tonumber(ARGV[2])
 local wanted = tonumber(ARGV[3])
-local candidate_limit = tonumber(ARGV[4])
+local scan_limit = tonumber(ARGV[4])
+local maintenance_limit = tonumber(ARGV[5])
 
-local expired = redis.call('ZRANGEBYSCORE', KEYS[3], '-inf', now, 'LIMIT', 0, candidate_limit)
+local expired = redis.call(
+    'ZRANGEBYSCORE', KEYS[4], '-inf', now, 'LIMIT', 0, maintenance_limit
+)
 for _, url in ipairs(expired) do
     local raw = redis.call('HGET', KEYS[1], url)
     if raw then
         local entry = cjson.decode(raw)
         if entry.state == 'leased' and tonumber(entry.lease_expires_at or 0) <= now then
-            local qraw = redis.call('HGET', KEYS[4], entry.queue_key)
+            local qraw = redis.call('HGET', KEYS[5], entry.queue_key)
             if qraw then
                 local queue = cjson.decode(qraw)
                 queue.active = math.max(0, tonumber(queue.active or 0) - 1)
-                redis.call('HSET', KEYS[4], entry.queue_key, cjson.encode(queue))
+                redis.call('HSET', KEYS[5], entry.queue_key, cjson.encode(queue))
             end
             entry.state = 'queued'
             entry.lease_token = cjson.null
             entry.lease_expires_at = 0
             redis.call('HSET', KEYS[1], url, cjson.encode(entry))
+            redis.call('ZREM', KEYS[4], url)
+            if tonumber(entry.available_at or 0) <= now then
+                redis.call(
+                    'ZADD', KEYS[2], -tonumber(entry.priority or 0), entry.ready_member
+                )
+            else
+                redis.call('ZADD', KEYS[3], tonumber(entry.available_at), url)
+            end
+            redis.call('HINCRBY', KEYS[7], 'leased', -1)
+            redis.call('HINCRBY', KEYS[7], 'queued', 1)
+        else
+            redis.call('ZREM', KEYS[4], url)
+        end
+    else
+        redis.call('ZREM', KEYS[4], url)
+    end
+end
+
+local due = redis.call(
+    'ZRANGEBYSCORE', KEYS[3], '-inf', now, 'LIMIT', 0, maintenance_limit
+)
+for _, url in ipairs(due) do
+    local raw = redis.call('HGET', KEYS[1], url)
+    if raw then
+        local entry = cjson.decode(raw)
+        if entry.state == 'queued' and tonumber(entry.available_at or 0) <= now then
             redis.call('ZREM', KEYS[3], url)
-            redis.call('ZADD', KEYS[2], tonumber(entry.available_at), url)
-            redis.call('HINCRBY', KEYS[6], 'leased', -1)
-            redis.call('HINCRBY', KEYS[6], 'queued', 1)
+            redis.call('ZADD', KEYS[2], -tonumber(entry.priority or 0), entry.ready_member)
         else
             redis.call('ZREM', KEYS[3], url)
         end
@@ -116,83 +140,75 @@ for _, url in ipairs(expired) do
     end
 end
 
-local urls = redis.call('ZRANGEBYSCORE', KEYS[2], '-inf', now, 'LIMIT', 0, candidate_limit)
-local candidates = {}
-for _, url in ipairs(urls) do
-    local raw = redis.call('HGET', KEYS[1], url)
-    if raw then
-        local entry = cjson.decode(raw)
-        if entry.state == 'queued' and tonumber(entry.available_at) <= now then
-            table.insert(candidates, entry)
-        end
-    else
-        redis.call('ZREM', KEYS[2], url)
-    end
-end
-
-table.sort(candidates, function(a, b)
-    local ap = tonumber(a.priority or 0)
-    local bp = tonumber(b.priority or 0)
-    if ap ~= bp then
-        return ap > bp
-    end
-    local aa = tonumber(a.available_at or 0)
-    local ba = tonumber(b.available_at or 0)
-    if aa ~= ba then
-        return aa < ba
-    end
-    return tonumber(a.sequence) < tonumber(b.sequence)
-end)
-
+local members = redis.call('ZRANGE', KEYS[2], 0, scan_limit - 1)
 local leases = {}
-for _, entry in ipairs(candidates) do
+for _, member in ipairs(members) do
     if #leases >= wanted then
         break
     end
-    local qraw = redis.call('HGET', KEYS[4], entry.queue_key)
-    local queue
-    if qraw then
-        queue = cjson.decode(qraw)
-    else
-        queue = {
-            max_concurrency = 1,
-            delay_seconds = 0,
-            blocked_until = 0,
-            active = 0,
-            issued = 0,
-            next_allowed_at = 0
-        }
-    end
+    local separator = string.find(member, '|', 1, true)
+    if separator then
+        local url = string.sub(member, separator + 1)
+        local raw = redis.call('HGET', KEYS[1], url)
+        if raw then
+            local entry = cjson.decode(raw)
+            if entry.state == 'queued' and tonumber(entry.available_at or 0) <= now then
+                local qraw = redis.call('HGET', KEYS[5], entry.queue_key)
+                local queue
+                if qraw then
+                    queue = cjson.decode(qraw)
+                else
+                    queue = {
+                        max_concurrency = 1,
+                        delay_seconds = 0,
+                        blocked_until = 0,
+                        active = 0,
+                        issued = 0,
+                        next_allowed_at = 0
+                    }
+                end
 
-    local crawl_limit = queue.crawl_limit
-    local under_limit = crawl_limit == nil or crawl_limit == cjson.null
-        or tonumber(queue.issued or 0) < tonumber(crawl_limit)
-    local allowed = tonumber(queue.blocked_until or 0) <= now
-        and tonumber(queue.next_allowed_at or 0) <= now
-        and tonumber(queue.active or 0) < tonumber(queue.max_concurrency or 1)
-        and under_limit
+                local crawl_limit = queue.crawl_limit
+                local under_limit = crawl_limit == nil or crawl_limit == cjson.null
+                    or tonumber(queue.issued or 0) < tonumber(crawl_limit)
+                local allowed = tonumber(queue.blocked_until or 0) <= now
+                    and tonumber(queue.next_allowed_at or 0) <= now
+                    and tonumber(queue.active or 0) < tonumber(queue.max_concurrency or 1)
+                    and under_limit
 
-    if allowed then
-        local lease_number = redis.call('INCR', KEYS[5])
-        local token = redis.sha1hex(entry.url .. ':' .. tostring(now) .. ':' .. tostring(lease_number))
-        entry.state = 'leased'
-        entry.attempt = tonumber(entry.attempt or 0) + 1
-        entry.lease_token = token
-        entry.lease_expires_at = now + lease_seconds
-        redis.call('HSET', KEYS[1], entry.url, cjson.encode(entry))
-        redis.call('ZREM', KEYS[2], entry.url)
-        redis.call('ZADD', KEYS[3], entry.lease_expires_at, entry.url)
+                if allowed then
+                    local lease_number = redis.call('INCR', KEYS[6])
+                    local token = redis.sha1hex(
+                        entry.url .. ':' .. tostring(now) .. ':' .. tostring(lease_number)
+                    )
+                    entry.state = 'leased'
+                    entry.attempt = tonumber(entry.attempt or 0) + 1
+                    entry.lease_token = token
+                    entry.lease_expires_at = now + lease_seconds
+                    redis.call('HSET', KEYS[1], entry.url, cjson.encode(entry))
+                    redis.call('ZREM', KEYS[2], entry.ready_member)
+                    redis.call('ZREM', KEYS[3], entry.url)
+                    redis.call('ZADD', KEYS[4], entry.lease_expires_at, entry.url)
 
-        queue.active = tonumber(queue.active or 0) + 1
-        queue.issued = tonumber(queue.issued or 0) + 1
-        if tonumber(queue.delay_seconds or 0) > 0 then
-            queue.next_allowed_at = now + tonumber(queue.delay_seconds)
+                    queue.active = tonumber(queue.active or 0) + 1
+                    queue.issued = tonumber(queue.issued or 0) + 1
+                    if tonumber(queue.delay_seconds or 0) > 0 then
+                        queue.next_allowed_at = now + tonumber(queue.delay_seconds)
+                    end
+                    redis.call('HSET', KEYS[5], entry.queue_key, cjson.encode(queue))
+                    redis.call('HINCRBY', KEYS[7], 'queued', -1)
+                    redis.call('HINCRBY', KEYS[7], 'leased', 1)
+
+                    table.insert(leases, entry)
+                end
+            else
+                redis.call('ZREM', KEYS[2], member)
+            end
+        else
+            redis.call('ZREM', KEYS[2], member)
         end
-        redis.call('HSET', KEYS[4], entry.queue_key, cjson.encode(queue))
-        redis.call('HINCRBY', KEYS[6], 'queued', -1)
-        redis.call('HINCRBY', KEYS[6], 'leased', 1)
-
-        table.insert(leases, entry)
+    else
+        redis.call('ZREM', KEYS[2], member)
     end
 end
 return cjson.encode(leases)
@@ -208,15 +224,17 @@ if entry.state ~= 'leased' or entry.lease_token ~= ARGV[2] then
     return redis.error_reply('lease is no longer active')
 end
 
-local qraw = redis.call('HGET', KEYS[4], entry.queue_key)
+local qraw = redis.call('HGET', KEYS[5], entry.queue_key)
 if qraw then
     local queue = cjson.decode(qraw)
     queue.active = math.max(0, tonumber(queue.active or 0) - 1)
-    redis.call('HSET', KEYS[4], entry.queue_key, cjson.encode(queue))
+    redis.call('HSET', KEYS[5], entry.queue_key, cjson.encode(queue))
 end
 
+redis.call('ZREM', KEYS[4], entry.url)
+redis.call('ZREM', KEYS[2], entry.ready_member)
 redis.call('ZREM', KEYS[3], entry.url)
-redis.call('HINCRBY', KEYS[5], 'leased', -1)
+redis.call('HINCRBY', KEYS[6], 'leased', -1)
 entry.state = ARGV[3]
 entry.lease_token = cjson.null
 entry.lease_expires_at = 0
@@ -228,11 +246,10 @@ end
 
 if ARGV[3] == 'queued' then
     entry.available_at = tonumber(ARGV[4])
-    redis.call('ZADD', KEYS[2], entry.available_at, entry.url)
-    redis.call('HINCRBY', KEYS[5], 'queued', 1)
+    redis.call('ZADD', KEYS[3], entry.available_at, entry.url)
+    redis.call('HINCRBY', KEYS[6], 'queued', 1)
 else
-    redis.call('ZREM', KEYS[2], entry.url)
-    redis.call('HINCRBY', KEYS[5], ARGV[3], 1)
+    redis.call('HINCRBY', KEYS[6], ARGV[3], 1)
 end
 redis.call('HSET', KEYS[1], entry.url, cjson.encode(entry))
 return 1
@@ -242,10 +259,10 @@ return 1
 class RedisFrontier:
     """Redis-backed frontier with atomic host-affine leasing semantics.
 
-    The backend uses Redis hashes and sorted sets plus Lua for multi-key state
-    transitions. All keys for one crawl share a cluster hash tag, so the atomic
-    scripts remain compatible with Redis Cluster when a crawl is assigned to one
-    slot.
+    Ready ordering and delayed availability use separate sorted sets: due requests
+    are promoted into a priority/FIFO ready set, so a newly due high-priority URL
+    is not hidden behind a large older low-priority backlog. State transitions are
+    atomic Lua scripts. All keys for one crawl share a Redis Cluster hash tag.
     """
 
     def __init__(
@@ -256,7 +273,7 @@ class RedisFrontier:
         owns_client: bool = False,
         candidate_multiplier: int = 50,
         min_candidate_window: int = 100,
-        reclaim_window: int = 1000,
+        maintenance_window: int = 5000,
     ) -> None:
         if not key_prefix:
             raise ValueError("key_prefix cannot be empty")
@@ -264,14 +281,14 @@ class RedisFrontier:
             raise ValueError("candidate_multiplier must be positive")
         if min_candidate_window <= 0:
             raise ValueError("min_candidate_window must be positive")
-        if reclaim_window <= 0:
-            raise ValueError("reclaim_window must be positive")
+        if maintenance_window <= 0:
+            raise ValueError("maintenance_window must be positive")
         self._redis = redis
         self.key_prefix = key_prefix.rstrip(":")
         self._owns_client = owns_client
         self.candidate_multiplier = candidate_multiplier
         self.min_candidate_window = min_candidate_window
-        self.reclaim_window = reclaim_window
+        self.maintenance_window = maintenance_window
 
     @classmethod
     def from_url(
@@ -323,17 +340,20 @@ class RedisFrontier:
             )
 
         added = 0
+        current = time.time()
         for crawl_id, payload in by_crawl.items():
             keys = self._keys(crawl_id)
             result = await self._redis.eval(
                 _ADD_SCRIPT,
-                5,
+                6,
                 keys.requests,
                 keys.ready,
+                keys.delayed,
                 keys.queues,
                 keys.sequence,
                 keys.counts,
                 json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+                current,
             )
             added += int(result)
         return added
@@ -370,17 +390,17 @@ class RedisFrontier:
         if lease_seconds <= 0:
             raise ValueError("lease_seconds must be positive")
         current = time.time() if now is None else now
-        candidate_window = max(
+        scan_limit = max(
             self.min_candidate_window,
             limit * self.candidate_multiplier,
-            self.reclaim_window,
         )
         keys = self._keys(crawl_id)
         result = await self._redis.eval(
             _LEASE_SCRIPT,
-            6,
+            7,
             keys.requests,
             keys.ready,
+            keys.delayed,
             keys.leased,
             keys.queues,
             keys.lease_sequence,
@@ -388,7 +408,8 @@ class RedisFrontier:
             current,
             lease_seconds,
             limit,
-            candidate_window,
+            scan_limit,
+            self.maintenance_window,
         )
         decoded = json.loads(_text(result))
         return [_lease_from_payload(crawl_id, item, current) for item in decoded]
@@ -426,6 +447,7 @@ class RedisFrontier:
         await self._redis.delete(
             keys.requests,
             keys.ready,
+            keys.delayed,
             keys.leased,
             keys.queues,
             keys.sequence,
@@ -444,9 +466,10 @@ class RedisFrontier:
         keys = self._keys(lease.request.crawl_id)
         await self._redis.eval(
             _FINISH_SCRIPT,
-            5,
+            6,
             keys.requests,
             keys.ready,
+            keys.delayed,
             keys.leased,
             keys.queues,
             keys.counts,
@@ -463,6 +486,7 @@ class RedisFrontier:
         return _RedisKeys(
             requests=f"{base}:requests",
             ready=f"{base}:ready",
+            delayed=f"{base}:delayed",
             leased=f"{base}:leased",
             queues=f"{base}:queues",
             sequence=f"{base}:sequence",
@@ -474,6 +498,7 @@ class RedisFrontier:
 class _RedisKeys:
     __slots__ = (
         "counts",
+        "delayed",
         "lease_sequence",
         "leased",
         "queues",
@@ -487,6 +512,7 @@ class _RedisKeys:
         *,
         requests: str,
         ready: str,
+        delayed: str,
         leased: str,
         queues: str,
         sequence: str,
@@ -495,6 +521,7 @@ class _RedisKeys:
     ) -> None:
         self.requests = requests
         self.ready = ready
+        self.delayed = delayed
         self.leased = leased
         self.queues = queues
         self.sequence = sequence
