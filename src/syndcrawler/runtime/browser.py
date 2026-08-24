@@ -93,6 +93,8 @@ class BrowserRenderer:
         executable = self.config.browser_executable_path
         if executable is not None:
             launch_options["executable_path"] = str(Path(executable))
+        if self.config.browser_type in {"chromium", "chrome"}:
+            launch_options["chromium_sandbox"] = self.config.browser_chromium_sandbox
 
         crawler = PlaywrightCrawler(
             headless=True,
