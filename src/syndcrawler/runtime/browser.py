@@ -50,6 +50,7 @@ class BrowserRenderer:
                 PlaywrightCrawlingContext,
             )
             from crawlee.proxy_configuration import ProxyConfiguration
+            from crawlee.storage_clients import MemoryStorageClient
         except ImportError as exc:
             raise RuntimeError(
                 "Browser escalation requires `pip install 'syndcrawler[browser]'` "
@@ -110,6 +111,7 @@ class BrowserRenderer:
             respect_robots_txt_file=self.config.respect_robots_txt,
             retry_on_blocked=False,
             proxy_configuration=proxy_configuration,
+            storage_client=MemoryStorageClient(),
         )
 
         @crawler.pre_navigation_hook
