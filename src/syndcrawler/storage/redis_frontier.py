@@ -93,7 +93,7 @@ for _, url in ipairs(expired) do
     local raw = redis.call('HGET', KEYS[1], url)
     if raw then
         local entry = cjson.decode(raw)
-        if entry.state == 'leased' and tonumber(entry.lease_expires_at or 0) <= now then
+        if entry.state == 'leased' then
             local qraw = redis.call('HGET', KEYS[5], entry.queue_key)
             if qraw then
                 local queue = cjson.decode(qraw)
@@ -105,13 +105,9 @@ for _, url in ipairs(expired) do
             entry.lease_expires_at = 0
             redis.call('HSET', KEYS[1], url, cjson.encode(entry))
             redis.call('ZREM', KEYS[4], url)
-            if tonumber(entry.available_at or 0) <= now then
-                redis.call(
-                    'ZADD', KEYS[2], -tonumber(entry.priority or 0), entry.ready_member
-                )
-            else
-                redis.call('ZADD', KEYS[3], tonumber(entry.available_at), url)
-            end
+            redis.call(
+                'ZADD', KEYS[2], -tonumber(entry.priority or 0), entry.ready_member
+            )
             redis.call('HINCRBY', KEYS[7], 'leased', -1)
             redis.call('HINCRBY', KEYS[7], 'queued', 1)
         else
@@ -129,7 +125,7 @@ for _, url in ipairs(due) do
     local raw = redis.call('HGET', KEYS[1], url)
     if raw then
         local entry = cjson.decode(raw)
-        if entry.state == 'queued' and tonumber(entry.available_at or 0) <= now then
+        if entry.state == 'queued' then
             redis.call('ZREM', KEYS[3], url)
             redis.call('ZADD', KEYS[2], -tonumber(entry.priority or 0), entry.ready_member)
         else
@@ -152,7 +148,7 @@ for _, member in ipairs(members) do
         local raw = redis.call('HGET', KEYS[1], url)
         if raw then
             local entry = cjson.decode(raw)
-            if entry.state == 'queued' and tonumber(entry.available_at or 0) <= now then
+            if entry.state == 'queued' then
                 local qraw = redis.call('HGET', KEYS[5], entry.queue_key)
                 local queue
                 if qraw then
@@ -259,10 +255,10 @@ return 1
 class RedisFrontier:
     """Redis-backed frontier with atomic host-affine leasing semantics.
 
-    Ready ordering and delayed availability use separate sorted sets: due requests
-    are promoted into a priority/FIFO ready set, so a newly due high-priority URL
-    is not hidden behind a large older low-priority backlog. State transitions are
-    atomic Lua scripts. All keys for one crawl share a Redis Cluster hash tag.
+    Ready ordering and delayed availability use separate sorted sets. The sorted
+    sets are authoritative for scheduling state, avoiding timestamp contradictions
+    from JSON floating-point round trips. State transitions are atomic Lua scripts,
+    and all keys for one crawl share a Redis Cluster hash tag.
     """
 
     def __init__(
