@@ -233,6 +233,37 @@ async def test_server_cancel_stops_future_work(server_site: str) -> None:
 
 
 @pytest.mark.asyncio
+async def test_server_cancel_drains_active_lease_before_purge(server_site: str) -> None:
+    prefix = f"syndcrawler-server-test:{uuid.uuid4().hex}"
+    crawl_id = f"server-{uuid.uuid4().hex}"
+    runtime = await ServerRuntime.from_urls(
+        redis_url=_redis_url(),
+        postgres_dsn=_postgres_dsn(),
+        config=_config(),
+        redis_key_prefix=prefix,
+    )
+    try:
+        await runtime.submit([server_site], crawl_id=crawl_id, max_pages=3)
+        lease = (await runtime.frontier.lease(crawl_id, limit=1, lease_seconds=60))[0]
+
+        cancelled = await runtime.cancel(crawl_id)
+        assert cancelled.lifecycle == "cancelled"
+        assert cancelled.stats["leased"] == 1
+        assert cancelled.stats["queued"] == 0
+
+        # The held lease remains valid after cancellation instead of disappearing
+        # beneath an in-flight worker.
+        await runtime.frontier.ack(lease)
+
+        cleaned = await runtime.cancel(crawl_id)
+        assert cleaned.lifecycle == "cancelled"
+        assert cleaned.stats == {"queued": 0, "leased": 0, "done": 0, "failed": 0}
+    finally:
+        await runtime.frontier.purge(crawl_id)
+        await runtime.close()
+
+
+@pytest.mark.asyncio
 async def test_server_submit_rejects_conflicting_manifest(server_site: str) -> None:
     prefix = f"syndcrawler-server-test:{uuid.uuid4().hex}"
     crawl_id = f"server-{uuid.uuid4().hex}"
