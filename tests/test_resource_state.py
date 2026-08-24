@@ -92,6 +92,42 @@ async def test_resource_state_tracks_representation_and_semantic_changes(
 
 
 @pytest.mark.asyncio
+async def test_resource_state_schedule_and_due_query(tmp_path: Path) -> None:
+    store = SQLiteCrawlStore(tmp_path / "crawl.sqlite3")
+    try:
+        await store.create_manifest(
+            "schedule",
+            ("https://example.com",),
+            follow_links=False,
+            same_domain=True,
+            max_pages=1,
+            now=1.0,
+        )
+        await store.put_result(
+            "schedule",
+            "https://example.com/product",
+            _record(b"one", title="Product", etag='"v1"'),
+            now=2.0,
+        )
+        scheduled = await store.schedule_resource(
+            "schedule",
+            "https://example.com/product",
+            interval_seconds=100.0,
+            next_fetch_at=102.0,
+        )
+        assert scheduled.recrawl_interval_seconds == 100.0
+        assert scheduled.next_fetch_at == 102.0
+
+        assert await store.due_resources("schedule", now=101.0) == []
+        due = await store.due_resources("schedule", now=102.0)
+        assert [state.request_url for state in due] == [
+            "https://example.com/product"
+        ]
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
 async def test_resource_state_survives_reopen(tmp_path: Path) -> None:
     path = tmp_path / "crawl.sqlite3"
     first = SQLiteCrawlStore(path)
@@ -109,6 +145,12 @@ async def test_resource_state_survives_reopen(tmp_path: Path) -> None:
         _record(b"one", title="Product", etag='"v1"'),
         now=2.0,
     )
+    await first.schedule_resource(
+        "persist",
+        "https://example.com/product",
+        interval_seconds=100.0,
+        next_fetch_at=102.0,
+    )
     await first.close()
 
     second = SQLiteCrawlStore(path)
@@ -122,5 +164,7 @@ async def test_resource_state_survives_reopen(tmp_path: Path) -> None:
         assert state.last_seen_at == 2.0
         assert state.change_count == 0
         assert state.last_change_kind is ChangeKind.NEW
+        assert state.recrawl_interval_seconds == 100.0
+        assert state.next_fetch_at == 102.0
     finally:
         await second.close()
