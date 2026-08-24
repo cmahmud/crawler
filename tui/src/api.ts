@@ -52,10 +52,15 @@ export type SubmitCrawl = {
   max_pages?: number;
 };
 
+export type FetchLike = (
+  input: string | URL | Request,
+  init?: RequestInit,
+) => Promise<Response>;
+
 export type ApiOptions = {
   baseUrl?: string;
   token?: string;
-  fetchImpl?: typeof fetch;
+  fetchImpl?: FetchLike;
 };
 
 export class ApiError extends Error {
@@ -81,7 +86,7 @@ function envBaseUrl(): string {
 export class SyndCrawlerApi {
   readonly baseUrl: string;
   private readonly token: string;
-  private readonly fetchImpl: typeof fetch;
+  private readonly fetchImpl: FetchLike;
 
   constructor(options: ApiOptions = {}) {
     this.baseUrl = (options.baseUrl ?? envBaseUrl()).replace(/\/$/, "");
