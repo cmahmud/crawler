@@ -45,7 +45,7 @@ async def run_worker_loop(
 
     owned_stop_event = stop_event is None
     event = stop_event or asyncio.Event()
-    cleanup_signals: Callable[[], None] = lambda: None
+    cleanup_signals: Callable[[], None] = _noop
     if owned_stop_event:
         cleanup_signals = _install_signal_handlers(event)
 
@@ -86,6 +86,10 @@ async def _wait(seconds: float, stop_event: asyncio.Event) -> None:
         await asyncio.wait_for(stop_event.wait(), timeout=seconds)
     except TimeoutError:
         return
+
+
+def _noop() -> None:
+    return
 
 
 def _install_signal_handlers(stop_event: asyncio.Event) -> Callable[[], None]:
