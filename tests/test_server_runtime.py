@@ -108,12 +108,14 @@ async def test_server_runtime_shares_crawl_across_workers_and_honors_budget(
         postgres_max_pool_size=4,
     )
     try:
+        assert await first.health() == {"ok": True, "postgres": True, "redis": True}
         submitted = await first.submit(
             [server_site],
             crawl_id=crawl_id,
             follow_links=True,
             max_pages=3,
         )
+        assert submitted.lifecycle == "active"
         assert submitted.result_count == 0
         assert submitted.completed is False
 
@@ -141,6 +143,7 @@ async def test_server_runtime_shares_crawl_across_workers_and_honors_budget(
         assert left.persisted + right.persisted == 2
 
         status = await first.status(crawl_id)
+        assert status.lifecycle == "completed"
         assert status.completed is True
         assert status.result_count == 3
         assert status.stats["done"] == 3
@@ -150,6 +153,8 @@ async def test_server_runtime_shares_crawl_across_workers_and_honors_budget(
         records = await second.results(crawl_id)
         assert len(records) == 3
         assert "Root" in {record.title for record in records}
+        page = await second.results_page(crawl_id, limit=2)
+        assert len(page) == 2
         assert await second.run_batch(crawl_id, limit=5) == left.__class__(
             leased=0,
             persisted=0,
@@ -160,6 +165,71 @@ async def test_server_runtime_shares_crawl_across_workers_and_honors_budget(
         await first.frontier.purge(crawl_id)
         await first.close()
         await second.close()
+
+
+@pytest.mark.asyncio
+async def test_server_pause_resume_and_worker_sweep(server_site: str) -> None:
+    prefix = f"syndcrawler-server-test:{uuid.uuid4().hex}"
+    crawl_id = f"server-{uuid.uuid4().hex}"
+    runtime = await ServerRuntime.from_urls(
+        redis_url=_redis_url(),
+        postgres_dsn=_postgres_dsn(),
+        config=_config(),
+        redis_key_prefix=prefix,
+    )
+    try:
+        await runtime.submit([server_site], crawl_id=crawl_id, max_pages=2)
+        paused = await runtime.pause(crawl_id)
+        assert paused.lifecycle == "paused"
+        assert (await runtime.run_batch(crawl_id, limit=5)).leased == 0
+        assert crawl_id not in await runtime.store.runnable_crawl_ids(limit=1000)
+
+        resumed = await runtime.resume_crawl(crawl_id)
+        assert resumed.lifecycle == "active"
+        assert crawl_id in await runtime.store.runnable_crawl_ids(limit=1000)
+
+        first = await runtime.run_runnable_once(max_crawls=1000, per_crawl_limit=1)
+        assert first.persisted == 1
+        assert first.discovered == 5
+
+        await runtime.frontier.set_queue_policy(
+            crawl_id,
+            "127.0.0.1",
+            QueuePolicy(max_concurrency=10),
+        )
+        second = await runtime.run_runnable_once(max_crawls=1000, per_crawl_limit=5)
+        assert second.persisted == 1
+        status = await runtime.status(crawl_id)
+        assert status.lifecycle == "completed"
+        assert status.result_count == 2
+        assert crawl_id not in await runtime.store.runnable_crawl_ids(limit=1000)
+    finally:
+        await runtime.frontier.purge(crawl_id)
+        await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_server_cancel_stops_future_work(server_site: str) -> None:
+    prefix = f"syndcrawler-server-test:{uuid.uuid4().hex}"
+    crawl_id = f"server-{uuid.uuid4().hex}"
+    runtime = await ServerRuntime.from_urls(
+        redis_url=_redis_url(),
+        postgres_dsn=_postgres_dsn(),
+        config=_config(),
+        redis_key_prefix=prefix,
+    )
+    try:
+        await runtime.submit([server_site], crawl_id=crawl_id, max_pages=3)
+        cancelled = await runtime.cancel(crawl_id)
+        assert cancelled.lifecycle == "cancelled"
+        assert cancelled.completed is False
+        assert cancelled.stats == {"queued": 0, "leased": 0, "done": 0, "failed": 0}
+        assert (await runtime.run_batch(crawl_id)).leased == 0
+        with pytest.raises(ValueError, match="cancelled crawl cannot be resumed"):
+            await runtime.resume_crawl(crawl_id)
+    finally:
+        await runtime.frontier.purge(crawl_id)
+        await runtime.close()
 
 
 @pytest.mark.asyncio
@@ -176,6 +246,7 @@ async def test_server_submit_rejects_conflicting_manifest(server_site: str) -> N
         await runtime.submit([server_site], crawl_id=crawl_id, max_pages=3)
         with pytest.raises(ValueError, match="different configuration"):
             await runtime.submit([server_site], crawl_id=crawl_id, max_pages=4)
+        await runtime.cancel(crawl_id)
     finally:
         await runtime.frontier.purge(crawl_id)
         await runtime.close()
