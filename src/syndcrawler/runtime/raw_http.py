@@ -8,7 +8,7 @@ from urllib.parse import unquote, urljoin, urlsplit
 from syndcrawler.config import CrawlConfig
 from syndcrawler.core.egress import EgressPolicy
 from syndcrawler.core.policy import FetchEngine
-from syndcrawler.core.routes import ProxyMode, ProxyPool, RouteBroker
+from syndcrawler.core.routes import ProxyPool, RouteBroker
 from syndcrawler.core.url import hostname
 
 _REDIRECT_STATUS_CODES = {301, 302, 303, 307, 308}
@@ -92,7 +92,10 @@ class SafeRawHttpFetcher:
                     timeout=timedelta(seconds=timeout_value),
                 ) as response:
                     status_code = response.status_code
-                    headers = {str(key).lower(): str(value) for key, value in response.headers.items()}
+                    headers = {
+                        str(key).lower(): str(value)
+                        for key, value in response.headers.items()
+                    }
 
                     if status_code in _REDIRECT_STATUS_CODES:
                         location = headers.get("location")
