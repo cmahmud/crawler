@@ -101,6 +101,14 @@ syndcrawler crawl https://example.com --browser
 
 A framework marker alone does not trigger a browser. The deterministic rendering assessment looks for evidence such as an empty app root, very little server-rendered content, script-heavy shells, and explicit JavaScript-required messages. SSR pages with meaningful content stay on HTTP.
 
+Chromium sandboxing is enabled by default. Some CI/container hosts cannot provide a usable Linux browser sandbox; for a trusted environment where that limitation is understood, it can be explicitly disabled:
+
+```bash
+syndcrawler crawl https://example.com --browser --browser-no-sandbox
+```
+
+Do not make `--browser-no-sandbox` the default for general-purpose or untrusted workloads.
+
 Robots compliance is enabled by default. Localhost/private-network destinations are blocked by default. For an intentional local development crawl:
 
 ```bash
@@ -120,6 +128,20 @@ Every parsed HTML record can carry deterministic structured evidence without inv
 - rendering assessment and selected fetch/network route
 
 Malformed embedded JSON-LD does not make the page fail.
+
+## Discovery document support
+
+The discovery layer can parse, normalize, and deduplicate URLs from:
+
+- XML sitemap URL sets
+- nested sitemap indexes
+- gzip-compressed sitemaps
+- plain-text sitemaps
+- RSS feeds
+- Atom feeds
+- `Sitemap:` directives in `robots.txt`
+
+Untrusted discovery documents are bounded in size. XML documents containing DTD/entity declarations are rejected, and gzip output is bounded while decompressing. Network integration for automatic discovery is being layered on top of these pure parsers so every discovered document and URL can cross the same egress policy before it enters the frontier.
 
 ## Python
 
@@ -202,7 +224,7 @@ The adaptive policy currently uses transparent EMA scoring. That is deliberate: 
 
 ## Near-term roadmap
 
-- sitemap/feed/runtime-network discovery
+- egress-controlled automatic sitemap/feed discovery
 - conditional fetch + content/change detection for recrawls
 - Redis frontier backend for VPS workers
 - provenance artifact store and extraction validation
