@@ -1,0 +1,11 @@
+.git
+.github
+.pytest_cache
+.ruff_cache
+.venv
+.syndcrawler
+__pycache__
+*.py[cod]
+*.sqlite3
+*.jsonl
+tests
