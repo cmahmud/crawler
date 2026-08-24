@@ -55,6 +55,8 @@ class Frontier(Protocol):
 
     async def add(self, *requests: FrontierRequest) -> int: ...
 
+    async def set_crawl_limit(self, crawl_id: str, limit: int | None) -> None: ...
+
     async def set_queue_policy(
         self,
         crawl_id: str,
@@ -105,16 +107,23 @@ class _QueueRuntime:
     next_allowed_at: float = 0.0
 
 
+@dataclass(slots=True)
+class _CrawlRuntime:
+    limit: int | None = None
+    issued: int = 0
+
+
 class MemoryFrontier:
     """Lease-based local frontier with host-affine politeness semantics.
 
-    It is intentionally storage-neutral in behavior so Redis/SQL/frontier-service
-    backends can implement the same contract later without changing workers.
+    Crawl-wide budgets count a URL only on its first lease. Retries and stale-lease
+    recovery therefore do not consume additional page budget.
     """
 
     def __init__(self) -> None:
         self._entries: dict[str, dict[str, _Entry]] = {}
         self._queues: dict[tuple[str, str], _QueueRuntime] = {}
+        self._crawls: dict[str, _CrawlRuntime] = {}
         self._sequence = 0
         self._lock = asyncio.Lock()
 
@@ -124,12 +133,19 @@ class MemoryFrontier:
             for raw in requests:
                 request = raw.normalized()
                 crawl = self._entries.setdefault(request.crawl_id, {})
+                self._crawl(request.crawl_id)
                 if request.url in crawl:
                     continue
                 crawl[request.url] = _Entry(request=request, sequence=self._sequence)
                 self._sequence += 1
                 added += 1
             return added
+
+    async def set_crawl_limit(self, crawl_id: str, limit: int | None) -> None:
+        if limit is not None and limit <= 0:
+            raise ValueError("crawl limit must be positive")
+        async with self._lock:
+            self._crawl(crawl_id).limit = limit
 
     async def set_queue_policy(
         self,
@@ -162,6 +178,7 @@ class MemoryFrontier:
         current = time.time() if now is None else now
         async with self._lock:
             crawl = self._entries.setdefault(crawl_id, {})
+            crawl_runtime = self._crawl(crawl_id)
             self._reclaim_expired(crawl, current)
 
             heap: list[tuple[int, float, int, str]] = []
@@ -186,12 +203,19 @@ class MemoryFrontier:
                 assert key is not None
                 queue = self._queue(crawl_id, key)
                 policy = queue.policy
+                first_lease = entry.attempt == 0
 
                 if policy.blocked_until > current or queue.next_allowed_at > current:
                     continue
                 if queue.active >= policy.max_concurrency:
                     continue
                 if policy.crawl_limit is not None and queue.issued >= policy.crawl_limit:
+                    continue
+                if (
+                    first_lease
+                    and crawl_runtime.limit is not None
+                    and crawl_runtime.issued >= crawl_runtime.limit
+                ):
                     continue
 
                 token = uuid.uuid4().hex
@@ -201,6 +225,8 @@ class MemoryFrontier:
                 entry.lease_expires_at = current + lease_seconds
                 queue.active += 1
                 queue.issued += 1
+                if first_lease:
+                    crawl_runtime.issued += 1
                 if policy.delay_seconds:
                     queue.next_allowed_at = current + policy.delay_seconds
 
@@ -255,6 +281,9 @@ class MemoryFrontier:
             for entry in self._entries.get(crawl_id, {}).values():
                 counts[entry.state.value] += 1
             return counts
+
+    def _crawl(self, crawl_id: str) -> _CrawlRuntime:
+        return self._crawls.setdefault(crawl_id, _CrawlRuntime())
 
     def _queue(self, crawl_id: str, queue_key: str) -> _QueueRuntime:
         return self._queues.setdefault((crawl_id, queue_key), _QueueRuntime())
