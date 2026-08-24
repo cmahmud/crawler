@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import signal
+from collections.abc import Callable
 
 from syndcrawler.runtime.server import ServerRuntime, WorkerSweepResult
 from syndcrawler.runtime.server_recrawl import ServerRecrawlScheduler, ServerRecrawlSweepResult
@@ -20,7 +22,13 @@ async def run_worker_loop(
     recrawl_lease_seconds: float = 120.0,
     stop_event: asyncio.Event | None = None,
 ) -> None:
-    """Continuously process initial crawl work and due distributed recrawls."""
+    """Continuously process initial crawl work and due distributed recrawls.
+
+    When no stop event is supplied, the daemon owns one and connects it to
+    SIGTERM/SIGINT where the event loop supports signal handlers. This lets
+    container shutdown finish the current sweep and return through the caller's
+    normal resource-cleanup path.
+    """
 
     if poll_interval_seconds <= 0:
         raise ValueError("poll_interval_seconds must be positive")
@@ -35,43 +43,66 @@ async def run_worker_loop(
     if recrawl_lease_seconds <= 0:
         raise ValueError("recrawl_lease_seconds must be positive")
 
+    owned_stop_event = stop_event is None
+    event = stop_event or asyncio.Event()
+    cleanup_signals: Callable[[], None] = lambda: None
+    if owned_stop_event:
+        cleanup_signals = _install_signal_handlers(event)
+
     recrawls = ServerRecrawlScheduler(
         runtime.store,
         runtime.config,
         policy=runtime.recrawl_policy,
     )
-    while stop_event is None or not stop_event.is_set():
-        try:
-            sweep = await runtime.run_runnable_once(
-                max_crawls=max_crawls,
-                per_crawl_limit=per_crawl_limit,
-            )
-            recrawl = await recrawls.run_once(
-                limit=recrawl_limit,
-                lease_seconds=recrawl_lease_seconds,
-            )
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            logger.exception("worker sweep failed")
-            await _wait(error_backoff_seconds, stop_event)
-            continue
+    try:
+        while not event.is_set():
+            try:
+                sweep = await runtime.run_runnable_once(
+                    max_crawls=max_crawls,
+                    per_crawl_limit=per_crawl_limit,
+                )
+                recrawl = await recrawls.run_once(
+                    limit=recrawl_limit,
+                    lease_seconds=recrawl_lease_seconds,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("worker sweep failed")
+                await _wait(error_backoff_seconds, event)
+                continue
 
-        _log_sweep(sweep, recrawl)
-        if sweep.leased == 0 and recrawl.claimed == 0:
-            await _wait(poll_interval_seconds, stop_event)
+            _log_sweep(sweep, recrawl)
+            if sweep.leased == 0 and recrawl.claimed == 0:
+                await _wait(poll_interval_seconds, event)
+    finally:
+        cleanup_signals()
 
 
-async def _wait(seconds: float, stop_event: asyncio.Event | None) -> None:
-    if stop_event is None:
-        await asyncio.sleep(seconds)
-        return
+async def _wait(seconds: float, stop_event: asyncio.Event) -> None:
     if stop_event.is_set():
         return
     try:
         await asyncio.wait_for(stop_event.wait(), timeout=seconds)
     except TimeoutError:
         return
+
+
+def _install_signal_handlers(stop_event: asyncio.Event) -> Callable[[], None]:
+    loop = asyncio.get_running_loop()
+    installed: list[signal.Signals] = []
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(sig, stop_event.set)
+        except (NotImplementedError, RuntimeError):
+            continue
+        installed.append(sig)
+
+    def cleanup() -> None:
+        for sig in installed:
+            loop.remove_signal_handler(sig)
+
+    return cleanup
 
 
 def _log_sweep(sweep: WorkerSweepResult, recrawl: ServerRecrawlSweepResult) -> None:
