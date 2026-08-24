@@ -117,7 +117,7 @@ jobs:
       - run: python -m pip install --upgrade pip
       - run: python -m pip install -e '.[server,dev]'
       - run: ruff check .
-      - run: pytest tests/test_server_runtime.py
+      - run: pytest tests/test_server_runtime.py tests/test_control_plane_api.py
 
   browser:
     runs-on: ubuntu-latest
