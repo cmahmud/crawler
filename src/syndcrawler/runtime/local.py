@@ -128,6 +128,7 @@ class LocalCrawler:
                 route=selected.route.value,
                 metadata={
                     "requested_url": context.request.url,
+                    "structured": parsed.structured.to_dict(),
                     "rendering_assessment": {
                         "requires_browser": rendering.requires_browser,
                         "score": rendering.score,
