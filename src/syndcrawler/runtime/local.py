@@ -209,6 +209,7 @@ class LocalCrawler:
                             "browser_escalation": {
                                 "attempted": True,
                                 "succeeded": False,
+                                "error": renderer.failures.get(url),
                             },
                         },
                     )
