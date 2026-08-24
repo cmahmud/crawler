@@ -7,6 +7,13 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+from syndcrawler.core.change import (
+    ChangeAssessment,
+    ChangeKind,
+    ContentFingerprint,
+    HttpValidators,
+    assess_change,
+)
 from syndcrawler.models import PageRecord
 
 _SCHEMA = """
@@ -30,6 +37,24 @@ CREATE TABLE IF NOT EXISTS crawl_results (
 
 CREATE INDEX IF NOT EXISTS idx_crawl_results_crawl
 ON crawl_results(crawl_id, recorded_at, request_url);
+
+CREATE TABLE IF NOT EXISTS crawl_resource_state (
+    crawl_id TEXT NOT NULL,
+    request_url TEXT NOT NULL,
+    etag TEXT,
+    last_modified TEXT,
+    content_sha256 TEXT NOT NULL,
+    semantic_sha256 TEXT NOT NULL,
+    first_seen_at REAL NOT NULL,
+    last_seen_at REAL NOT NULL,
+    last_changed_at REAL NOT NULL,
+    change_count INTEGER NOT NULL DEFAULT 0,
+    last_change_kind TEXT NOT NULL,
+    PRIMARY KEY(crawl_id, request_url)
+);
+
+CREATE INDEX IF NOT EXISTS idx_crawl_resource_state_seen
+ON crawl_resource_state(crawl_id, last_seen_at, request_url);
 """
 
 
@@ -44,8 +69,20 @@ class CrawlManifest:
     updated_at: float
 
 
+@dataclass(frozen=True, slots=True)
+class ResourceState:
+    crawl_id: str
+    request_url: str
+    fingerprint: ContentFingerprint
+    first_seen_at: float
+    last_seen_at: float
+    last_changed_at: float
+    change_count: int
+    last_change_kind: ChangeKind
+
+
 class SQLiteCrawlStore:
-    """Durable crawl metadata and idempotent result storage."""
+    """Durable crawl metadata, latest results, and resource change state."""
 
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
@@ -126,7 +163,7 @@ class SQLiteCrawlStore:
         record: PageRecord,
         *,
         now: float | None = None,
-    ) -> None:
+    ) -> ChangeAssessment | None:
         current = time.time() if now is None else now
         payload = json.dumps(
             record.to_dict(),
@@ -134,10 +171,39 @@ class SQLiteCrawlStore:
             separators=(",", ":"),
             sort_keys=True,
         )
+        fingerprint = _fingerprint_from_record(record)
+
         async with self._lock:
             self._ensure_open()
             self._connection.execute("BEGIN IMMEDIATE")
             try:
+                assessment = None
+                if fingerprint is not None:
+                    previous_row = self._connection.execute(
+                        """
+                        SELECT * FROM crawl_resource_state
+                        WHERE crawl_id = ? AND request_url = ?
+                        """,
+                        (crawl_id, request_url),
+                    ).fetchone()
+                    previous = (
+                        _resource_state_from_row(previous_row)
+                        if previous_row is not None
+                        else None
+                    )
+                    assessment = assess_change(
+                        previous.fingerprint if previous is not None else None,
+                        fingerprint,
+                    )
+                    self._upsert_resource_state(
+                        crawl_id,
+                        request_url,
+                        fingerprint,
+                        assessment,
+                        previous,
+                        current,
+                    )
+
                 self._connection.execute(
                     """
                     INSERT INTO crawl_results (
@@ -157,9 +223,88 @@ class SQLiteCrawlStore:
                     (current, crawl_id),
                 )
                 self._connection.commit()
+                return assessment
             except Exception:
                 self._connection.rollback()
                 raise
+
+    async def mark_not_modified(
+        self,
+        crawl_id: str,
+        request_url: str,
+        *,
+        now: float | None = None,
+    ) -> ResourceState:
+        current = time.time() if now is None else now
+        async with self._lock:
+            self._ensure_open()
+            self._connection.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._connection.execute(
+                    """
+                    SELECT * FROM crawl_resource_state
+                    WHERE crawl_id = ? AND request_url = ?
+                    """,
+                    (crawl_id, request_url),
+                ).fetchone()
+                if row is None:
+                    raise ValueError(f"resource state does not exist: {request_url}")
+                self._connection.execute(
+                    """
+                    UPDATE crawl_resource_state
+                    SET last_seen_at = ?, last_change_kind = ?
+                    WHERE crawl_id = ? AND request_url = ?
+                    """,
+                    (
+                        current,
+                        ChangeKind.NOT_MODIFIED.value,
+                        crawl_id,
+                        request_url,
+                    ),
+                )
+                self._connection.execute(
+                    """
+                    UPDATE crawl_manifests SET updated_at = ?
+                    WHERE crawl_id = ?
+                    """,
+                    (current, crawl_id),
+                )
+                self._connection.commit()
+            except Exception:
+                self._connection.rollback()
+                raise
+        state = await self.get_resource_state(crawl_id, request_url)
+        assert state is not None
+        return state
+
+    async def get_resource_state(
+        self,
+        crawl_id: str,
+        request_url: str,
+    ) -> ResourceState | None:
+        async with self._lock:
+            self._ensure_open()
+            row = self._connection.execute(
+                """
+                SELECT * FROM crawl_resource_state
+                WHERE crawl_id = ? AND request_url = ?
+                """,
+                (crawl_id, request_url),
+            ).fetchone()
+            return _resource_state_from_row(row) if row is not None else None
+
+    async def resource_states(self, crawl_id: str) -> list[ResourceState]:
+        async with self._lock:
+            self._ensure_open()
+            rows = self._connection.execute(
+                """
+                SELECT * FROM crawl_resource_state
+                WHERE crawl_id = ?
+                ORDER BY last_seen_at ASC, request_url ASC
+                """,
+                (crawl_id,),
+            ).fetchall()
+        return [_resource_state_from_row(row) for row in rows]
 
     async def results(self, crawl_id: str) -> list[PageRecord]:
         async with self._lock:
@@ -191,6 +336,58 @@ class SQLiteCrawlStore:
             self._connection.close()
             self._closed = True
 
+    def _upsert_resource_state(
+        self,
+        crawl_id: str,
+        request_url: str,
+        fingerprint: ContentFingerprint,
+        assessment: ChangeAssessment,
+        previous: ResourceState | None,
+        current: float,
+    ) -> None:
+        first_seen = previous.first_seen_at if previous is not None else current
+        changed = assessment.changed
+        last_changed = (
+            current
+            if previous is None or changed
+            else previous.last_changed_at
+        )
+        change_count = (
+            (previous.change_count if previous is not None else 0)
+            + int(changed)
+        )
+        self._connection.execute(
+            """
+            INSERT INTO crawl_resource_state (
+                crawl_id, request_url, etag, last_modified, content_sha256,
+                semantic_sha256, first_seen_at, last_seen_at, last_changed_at,
+                change_count, last_change_kind
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(crawl_id, request_url) DO UPDATE SET
+                etag = excluded.etag,
+                last_modified = excluded.last_modified,
+                content_sha256 = excluded.content_sha256,
+                semantic_sha256 = excluded.semantic_sha256,
+                last_seen_at = excluded.last_seen_at,
+                last_changed_at = excluded.last_changed_at,
+                change_count = excluded.change_count,
+                last_change_kind = excluded.last_change_kind
+            """,
+            (
+                crawl_id,
+                request_url,
+                fingerprint.validators.etag,
+                fingerprint.validators.last_modified,
+                fingerprint.content_sha256,
+                fingerprint.semantic_sha256,
+                first_seen,
+                current,
+                last_changed,
+                change_count,
+                assessment.kind.value,
+            ),
+        )
+
     def _migrate_manifest_schema(self) -> None:
         columns = {
             str(row["name"])
@@ -218,6 +415,53 @@ def _manifest_from_row(row: sqlite3.Row) -> CrawlManifest:
         max_pages=int(row["max_pages"]),
         created_at=float(row["created_at"]),
         updated_at=float(row["updated_at"]),
+    )
+
+
+def _resource_state_from_row(row: sqlite3.Row) -> ResourceState:
+    return ResourceState(
+        crawl_id=str(row["crawl_id"]),
+        request_url=str(row["request_url"]),
+        fingerprint=ContentFingerprint(
+            content_sha256=str(row["content_sha256"]),
+            semantic_sha256=str(row["semantic_sha256"]),
+            validators=HttpValidators(
+                etag=str(row["etag"]) if row["etag"] is not None else None,
+                last_modified=(
+                    str(row["last_modified"])
+                    if row["last_modified"] is not None
+                    else None
+                ),
+            ),
+        ),
+        first_seen_at=float(row["first_seen_at"]),
+        last_seen_at=float(row["last_seen_at"]),
+        last_changed_at=float(row["last_changed_at"]),
+        change_count=int(row["change_count"]),
+        last_change_kind=ChangeKind(str(row["last_change_kind"])),
+    )
+
+
+def _fingerprint_from_record(record: PageRecord) -> ContentFingerprint | None:
+    value = record.metadata.get("fingerprint")
+    if not isinstance(value, dict):
+        return None
+    content_sha256 = value.get("content_sha256")
+    semantic_sha256 = value.get("semantic_sha256")
+    if not isinstance(content_sha256, str) or not isinstance(semantic_sha256, str):
+        return None
+    validators = value.get("validators")
+    if not isinstance(validators, dict):
+        validators = {}
+    etag = validators.get("etag")
+    last_modified = validators.get("last_modified")
+    return ContentFingerprint(
+        content_sha256=content_sha256,
+        semantic_sha256=semantic_sha256,
+        validators=HttpValidators(
+            etag=etag if isinstance(etag, str) else None,
+            last_modified=last_modified if isinstance(last_modified, str) else None,
+        ),
     )
 
 
