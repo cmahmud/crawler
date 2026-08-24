@@ -9,11 +9,13 @@ from pathlib import Path
 from syndcrawler.config import CrawlConfig
 from syndcrawler.core.frontier import FrontierRequest
 from syndcrawler.core.url import canonicalize_url
+from syndcrawler.discovery import SitemapDiscoveryClient
 from syndcrawler.models import PageRecord
 from syndcrawler.runtime.local import LocalCrawler
 from syndcrawler.storage import CrawlManifest, SQLiteCrawlStore, SQLiteFrontier
 
 _CRAWL_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+_SITEMAP_PRIORITY = -10
 
 
 @dataclass(frozen=True, slots=True)
@@ -82,6 +84,8 @@ class ResumableCrawler:
                     for seed in safe_seeds
                 )
             )
+            if follow_links and self.config.sitemap_discovery_enabled:
+                await self._seed_from_sitemaps(frontier, crawl_id, safe_seeds)
         finally:
             await store.close()
             await frontier.close()
@@ -152,6 +156,45 @@ class ResumableCrawler:
     def state_path(self, crawl_id: str) -> Path:
         _validate_crawl_id(crawl_id)
         return self.state_dir / f"{crawl_id}.sqlite3"
+
+    async def _seed_from_sitemaps(
+        self,
+        frontier: SQLiteFrontier,
+        crawl_id: str,
+        seeds: tuple[str, ...],
+    ) -> None:
+        discovery = SitemapDiscoveryClient(self.config)
+        remaining_documents = self.config.sitemap_max_documents
+        remaining_urls = self.config.sitemap_max_urls
+
+        for seed in seeds:
+            if remaining_documents <= 0 or remaining_urls <= 0:
+                return
+            result = await discovery.discover(
+                seed,
+                max_documents=remaining_documents,
+                max_depth=self.config.sitemap_max_depth,
+                max_urls=remaining_urls,
+            )
+            remaining_documents -= len(result.documents_fetched)
+            remaining_urls -= len(result.urls)
+            if not result.urls:
+                continue
+            await frontier.add(
+                *(
+                    FrontierRequest(
+                        item.url,
+                        crawl_id=crawl_id,
+                        priority=_SITEMAP_PRIORITY,
+                        metadata={
+                            "discovered_via": item.via,
+                            "discovery_source": item.source_url,
+                            "discovery_depth": item.depth,
+                        },
+                    )
+                    for item in result.urls
+                )
+            )
 
     async def _run_until_idle(
         self,
