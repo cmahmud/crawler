@@ -69,6 +69,7 @@ class ResumableCrawler:
                 crawl_id,
                 safe_seeds,
                 follow_links=follow_links,
+                same_domain=self.config.same_domain,
                 max_pages=page_limit,
             )
             await frontier.add(
@@ -95,11 +96,17 @@ class ResumableCrawler:
 
         frontier = SQLiteFrontier(path)
         store = SQLiteCrawlStore(path)
-        fetcher = LocalCrawler(replace(self.config, output=None))
         try:
             manifest = await store.get_manifest(crawl_id)
             if manifest is None:
                 raise ValueError(f"crawl manifest does not exist: {crawl_id}")
+            fetcher = LocalCrawler(
+                replace(
+                    self.config,
+                    output=None,
+                    same_domain=manifest.same_domain,
+                )
+            )
             await self._run_until_idle(frontier, store, fetcher, manifest)
             stats = await frontier.stats(crawl_id)
             records = tuple(await store.results(crawl_id))
