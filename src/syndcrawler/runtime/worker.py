@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from typing import Protocol
 
 from syndcrawler.core.change import ChangeAssessment
-from syndcrawler.core.frontier import Frontier, FrontierLease, FrontierRequest
+from syndcrawler.core.frontier import Frontier, FrontierRequest
 from syndcrawler.core.results import ResultStore
 from syndcrawler.core.url import canonicalize_url
 from syndcrawler.models import PageRecord
