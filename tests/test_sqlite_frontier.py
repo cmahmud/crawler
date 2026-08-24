@@ -70,3 +70,56 @@ async def test_sqlite_frontier_persists_queue_policy_and_retry_time(tmp_path: Pa
     assert retried[0].request.url == "https://example.com/a"
     assert retried[0].attempt == 2
     await resumed.close()
+
+
+@pytest.mark.asyncio
+async def test_sqlite_crawl_limit_counts_first_leases_not_retries(tmp_path: Path) -> None:
+    path = tmp_path / "frontier.sqlite3"
+    frontier = SQLiteFrontier(path)
+    await frontier.set_crawl_limit("limited", 2)
+    await frontier.add(
+        FrontierRequest("https://a.example/page", crawl_id="limited"),
+        FrontierRequest("https://b.example/page", crawl_id="limited"),
+        FrontierRequest("https://c.example/page", crawl_id="limited"),
+    )
+
+    first = await frontier.lease("limited", limit=2, now=100, lease_seconds=10)
+    assert len(first) == 2
+    await frontier.retry(first[0], available_at=100, error="temporary")
+    await frontier.ack(first[1])
+
+    retried = await frontier.lease("limited", limit=2, now=100, lease_seconds=10)
+    assert len(retried) == 1
+    assert retried[0].request.url == first[0].request.url
+    assert retried[0].attempt == 2
+    await frontier.ack(retried[0])
+
+    assert await frontier.lease("limited", limit=2, now=100, lease_seconds=10) == []
+    assert (await frontier.stats("limited"))["queued"] == 1
+    await frontier.close()
+
+
+@pytest.mark.asyncio
+async def test_sqlite_crawl_limit_reconstructs_usage_for_existing_state(tmp_path: Path) -> None:
+    path = tmp_path / "frontier.sqlite3"
+    frontier = SQLiteFrontier(path)
+    await frontier.add(
+        FrontierRequest("https://a.example/page", crawl_id="migrate"),
+        FrontierRequest("https://b.example/page", crawl_id="migrate"),
+    )
+    first = (await frontier.lease("migrate", limit=1, now=100, lease_seconds=10))[0]
+    await frontier.ack(first)
+    await frontier.close()
+
+    import sqlite3
+
+    connection = sqlite3.connect(path)
+    connection.execute("DELETE FROM frontier_crawls WHERE crawl_id = ?", ("migrate",))
+    connection.commit()
+    connection.close()
+
+    resumed = SQLiteFrontier(path)
+    await resumed.set_crawl_limit("migrate", 1)
+    assert await resumed.lease("migrate", limit=1, now=100, lease_seconds=10) == []
+    assert (await resumed.stats("migrate"))["queued"] == 1
+    await resumed.close()
