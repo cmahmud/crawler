@@ -18,6 +18,7 @@ if TYPE_CHECKING:
 _ADD_SCRIPT = r"""
 local requests = cjson.decode(ARGV[1])
 local now = tonumber(ARGV[2])
+redis.call('HSETNX', KEYS[7], 'issued', 0)
 local added = 0
 for _, entry in ipairs(requests) do
     if redis.call('HEXISTS', KEYS[1], entry.url) == 0 then
@@ -50,6 +51,16 @@ for _, entry in ipairs(requests) do
     end
 end
 return added
+"""
+
+_SET_CRAWL_LIMIT_SCRIPT = r"""
+redis.call('HSETNX', KEYS[1], 'issued', 0)
+if ARGV[1] == '' then
+    redis.call('HDEL', KEYS[1], 'limit')
+else
+    redis.call('HSET', KEYS[1], 'limit', tonumber(ARGV[1]))
+end
+return 1
 """
 
 _SET_QUEUE_POLICY_SCRIPT = r"""
@@ -85,6 +96,10 @@ local lease_seconds = tonumber(ARGV[2])
 local wanted = tonumber(ARGV[3])
 local scan_limit = tonumber(ARGV[4])
 local maintenance_limit = tonumber(ARGV[5])
+
+redis.call('HSETNX', KEYS[8], 'issued', 0)
+local global_limit = redis.call('HGET', KEYS[8], 'limit')
+local global_issued = tonumber(redis.call('HGET', KEYS[8], 'issued') or '0')
 
 local expired = redis.call(
     'ZRANGEBYSCORE', KEYS[4], '-inf', now, 'LIMIT', 0, maintenance_limit
@@ -164,13 +179,18 @@ for _, member in ipairs(members) do
                     }
                 end
 
-                local crawl_limit = queue.crawl_limit
-                local under_limit = crawl_limit == nil or crawl_limit == cjson.null
-                    or tonumber(queue.issued or 0) < tonumber(crawl_limit)
+                local queue_limit = queue.crawl_limit
+                local under_queue_limit = queue_limit == nil or queue_limit == cjson.null
+                    or tonumber(queue.issued or 0) < tonumber(queue_limit)
+                local first_lease = tonumber(entry.attempt or 0) == 0
+                local under_global_limit = not first_lease
+                    or global_limit == false
+                    or global_issued < tonumber(global_limit)
                 local allowed = tonumber(queue.blocked_until or 0) <= now
                     and tonumber(queue.next_allowed_at or 0) <= now
                     and tonumber(queue.active or 0) < tonumber(queue.max_concurrency or 1)
-                    and under_limit
+                    and under_queue_limit
+                    and under_global_limit
 
                 if allowed then
                     local lease_number = redis.call('INCR', KEYS[6])
@@ -192,6 +212,10 @@ for _, member in ipairs(members) do
                         queue.next_allowed_at = now + tonumber(queue.delay_seconds)
                     end
                     redis.call('HSET', KEYS[5], entry.queue_key, cjson.encode(queue))
+                    if first_lease then
+                        global_issued = global_issued + 1
+                        redis.call('HSET', KEYS[8], 'issued', global_issued)
+                    end
                     redis.call('HINCRBY', KEYS[7], 'queued', -1)
                     redis.call('HINCRBY', KEYS[7], 'leased', 1)
 
@@ -256,9 +280,9 @@ class RedisFrontier:
     """Redis-backed frontier with atomic host-affine leasing semantics.
 
     Ready ordering and delayed availability use separate sorted sets. The sorted
-    sets are authoritative for scheduling state, avoiding timestamp contradictions
-    from JSON floating-point round trips. State transitions are atomic Lua scripts,
-    and all keys for one crawl share a Redis Cluster hash tag.
+    sets are authoritative for scheduling state. A per-crawl hash carries the
+    unique-first-lease budget so multiple workers cannot overrun `max_pages`.
+    All keys for one crawl share a Redis Cluster hash tag.
     """
 
     def __init__(
@@ -341,18 +365,30 @@ class RedisFrontier:
             keys = self._keys(crawl_id)
             result = await self._redis.eval(
                 _ADD_SCRIPT,
-                6,
+                7,
                 keys.requests,
                 keys.ready,
                 keys.delayed,
                 keys.queues,
                 keys.sequence,
                 keys.counts,
+                keys.crawl,
                 json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
                 current,
             )
             added += int(result)
         return added
+
+    async def set_crawl_limit(self, crawl_id: str, limit: int | None) -> None:
+        if limit is not None and limit <= 0:
+            raise ValueError("crawl limit must be positive")
+        keys = self._keys(crawl_id)
+        await self._redis.eval(
+            _SET_CRAWL_LIMIT_SCRIPT,
+            1,
+            keys.crawl,
+            "" if limit is None else limit,
+        )
 
     async def set_queue_policy(
         self,
@@ -393,7 +429,7 @@ class RedisFrontier:
         keys = self._keys(crawl_id)
         result = await self._redis.eval(
             _LEASE_SCRIPT,
-            7,
+            8,
             keys.requests,
             keys.ready,
             keys.delayed,
@@ -401,6 +437,7 @@ class RedisFrontier:
             keys.queues,
             keys.lease_sequence,
             keys.counts,
+            keys.crawl,
             current,
             lease_seconds,
             limit,
@@ -449,6 +486,7 @@ class RedisFrontier:
             keys.sequence,
             keys.lease_sequence,
             keys.counts,
+            keys.crawl,
         )
 
     async def _finish(
@@ -488,12 +526,14 @@ class RedisFrontier:
             sequence=f"{base}:sequence",
             lease_sequence=f"{base}:lease-sequence",
             counts=f"{base}:counts",
+            crawl=f"{base}:crawl",
         )
 
 
 class _RedisKeys:
     __slots__ = (
         "counts",
+        "crawl",
         "delayed",
         "lease_sequence",
         "leased",
@@ -514,6 +554,7 @@ class _RedisKeys:
         sequence: str,
         lease_sequence: str,
         counts: str,
+        crawl: str,
     ) -> None:
         self.requests = requests
         self.ready = ready
@@ -523,6 +564,7 @@ class _RedisKeys:
         self.sequence = sequence
         self.lease_sequence = lease_sequence
         self.counts = counts
+        self.crawl = crawl
 
 
 def _lease_from_payload(
