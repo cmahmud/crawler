@@ -21,6 +21,7 @@ from syndcrawler.runtime.server import (
 from syndcrawler.runtime.server_env import env_bool, server_runtime_from_env
 
 _bearer = HTTPBearer(auto_error=False)
+_bearer_dependency = Depends(_bearer)
 
 
 class CrawlSubmitRequest(BaseModel):
@@ -95,7 +96,7 @@ def create_app(
         app.state.runtime = injected_runtime
 
     async def require_auth(
-        credentials: HTTPAuthorizationCredentials | None = Depends(_bearer),
+        credentials: HTTPAuthorizationCredentials | None = _bearer_dependency,
     ) -> None:
         if allow_unauthenticated:
             return
