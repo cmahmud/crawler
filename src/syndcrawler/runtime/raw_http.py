@@ -6,6 +6,7 @@ from datetime import timedelta
 from urllib.parse import unquote, urljoin, urlsplit
 
 from syndcrawler.config import CrawlConfig
+from syndcrawler.core.change import HttpValidators
 from syndcrawler.core.egress import EgressPolicy
 from syndcrawler.core.policy import FetchEngine
 from syndcrawler.core.routes import ProxyPool, RouteBroker
@@ -28,6 +29,10 @@ class RawHttpResponse:
     redirect_chain: tuple[str, ...]
     engine: str
     route: str
+
+    @property
+    def not_modified(self) -> bool:
+        return self.status_code == 304
 
 
 class SafeRawHttpFetcher:
@@ -54,6 +59,7 @@ class SafeRawHttpFetcher:
         *,
         max_bytes: int,
         timeout_seconds: float | None = None,
+        validators: HttpValidators | None = None,
     ) -> RawHttpResponse:
         if max_bytes <= 0:
             raise ValueError("max_bytes must be positive")
@@ -83,11 +89,13 @@ class SafeRawHttpFetcher:
         client = ImpitHttpClient(follow_redirects=False)
         current_url = requested_url
         redirects: list[str] = []
+        conditional_headers = validators.request_headers() if validators else {}
 
         try:
             for hop in range(self.max_redirects + 1):
                 async with client.stream(
                     current_url,
+                    headers=conditional_headers or None,
                     proxy_info=proxy_info,
                     timeout=timedelta(seconds=timeout_value),
                 ) as response:
@@ -119,6 +127,8 @@ class SafeRawHttpFetcher:
                         next_url = await self.egress.validate(
                             urljoin(current_url, location)
                         )
+                        if not _same_origin(current_url, next_url):
+                            conditional_headers = {}
                         redirects.append(next_url)
                         current_url = next_url
                         continue
@@ -159,6 +169,28 @@ async def _read_bounded(response, *, max_bytes: int) -> bytes:
             raise RawFetchError(f"response exceeds {max_bytes} bytes")
         chunks.append(chunk)
     return b"".join(chunks)
+
+
+def _same_origin(first: str, second: str) -> bool:
+    left = urlsplit(first)
+    right = urlsplit(second)
+    return (
+        left.scheme.lower(),
+        (left.hostname or "").lower(),
+        left.port or _default_port(left.scheme),
+    ) == (
+        right.scheme.lower(),
+        (right.hostname or "").lower(),
+        right.port or _default_port(right.scheme),
+    )
+
+
+def _default_port(scheme: str) -> int | None:
+    if scheme.lower() == "http":
+        return 80
+    if scheme.lower() == "https":
+        return 443
+    return None
 
 
 def _content_length(value: str | None) -> int | None:
