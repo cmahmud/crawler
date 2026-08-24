@@ -18,6 +18,23 @@ The TUI is deliberately API-only: it never talks directly to Redis or PostgreSQL
 - responsive narrow terminal layout
 - clear authentication/API errors
 
+## Motion
+
+Motion is presentation-only and was added after the functional operator path passed CI.
+
+- active crawls use a subtle rotating activity glyph
+- the header shows a small fetch → parse → store flow animation
+- the product name has a short startup reveal
+- no API request, selection, form, or lifecycle action depends on an animation frame
+
+Disable motion completely with:
+
+```bash
+SYNCRAWLER_TUI_REDUCED_MOTION=true ./tui/run.sh
+```
+
+`TERM=dumb` also selects the static fallback automatically.
+
 ## Run from source
 
 The source runner loads the repository `.env` by default, so the existing API token and port are reused:
@@ -34,6 +51,7 @@ Override the env file with `SYNCRAWLER_TUI_ENV_FILE`.
 - `SYNCRAWLER_TUI_API_URL` — optional full base URL, highest priority.
 - `SYNCRAWLER_API_URL` — optional fallback full base URL.
 - `SYNCRAWLER_API_BIND` + `SYNCRAWLER_API_PORT` — used to derive the local URL when no full URL is supplied. Wildcard binds are normalized to `127.0.0.1`.
+- `SYNCRAWLER_TUI_REDUCED_MOTION` — use static motion fallbacks when true.
 
 ## Build a standalone binary
 
@@ -77,5 +95,3 @@ New crawl:
 ## Design lineage
 
 The implementation uses the React OpenTUI runtime/scaffold patterns from `cmahmud/opentui` and `cmahmud/create-tui`. Responsive terminal breakpoints, motion sequencing, and reduced-motion behavior are informed by `cmahmud/syndrid-tui-studio`.
-
-Motion is intentionally layered after the functional operator path is passing CI.
