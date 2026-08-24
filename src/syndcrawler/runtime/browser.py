@@ -154,7 +154,11 @@ class BrowserRenderer:
                 links=tuple(links),
                 engine=selected.engine.value,
                 route=selected.route.value,
-                metadata={"rendered": True, "requested_url": original_url},
+                metadata={
+                    "rendered": True,
+                    "requested_url": original_url,
+                    "structured": parsed.structured.to_dict(),
+                },
             )
             records[original_url] = record
             self.failures.pop(original_url, None)
