@@ -7,7 +7,11 @@ from urllib.parse import urlsplit, urlunsplit
 from syndcrawler.config import CrawlConfig
 from syndcrawler.core.egress import UnsafeTargetError
 from syndcrawler.core.url import same_hostname
-from syndcrawler.discovery.documents import DiscoveryParseError, parse_robots_sitemaps, parse_sitemap
+from syndcrawler.discovery.documents import (
+    DiscoveryParseError,
+    parse_robots_sitemaps,
+    parse_sitemap,
+)
 from syndcrawler.runtime.raw_http import RawFetchError, SafeRawHttpFetcher
 
 _ROBOTS_MAX_BYTES = 1024 * 1024
