@@ -31,6 +31,7 @@ class BrowserRenderer:
         self.egress = egress
         self.broker = broker
         self.proxy_pool = proxy_pool
+        self.failures: dict[str, str] = {}
 
     async def render(
         self,
@@ -122,15 +123,16 @@ class BrowserRenderer:
             status_code = context.response.status
 
             if status_code in _BLOCKED_STATUS_CODES:
+                message = f"access-controlled response: {status_code}"
+                self.failures[original_url] = message
                 self.broker.observe(request_key, success=False, quality=0.0)
-                context.log.warning(
-                    f"Browser rendering stopped at access-controlled response: {status_code}"
-                )
+                context.log.warning(f"Browser rendering stopped at {message}")
                 return
 
             try:
                 source_url = await self.egress.validate(context.page.url)
             except UnsafeTargetError as exc:
+                self.failures[original_url] = f"egress policy: {exc}"
                 self.broker.observe(request_key, success=False, quality=0.0)
                 context.log.error(f"Browser navigation violated egress policy: {exc}")
                 return
@@ -155,6 +157,7 @@ class BrowserRenderer:
                 metadata={"rendered": True, "requested_url": original_url},
             )
             records[original_url] = record
+            self.failures.pop(original_url, None)
             await context.push_data(record.to_dict())
 
         @crawler.failed_request_handler
@@ -162,7 +165,10 @@ class BrowserRenderer:
             context: BasicCrawlingContext,
             error: Exception,
         ) -> None:
+            original_url = canonicalize_url(context.request.url)
             request_key = f"browser:{context.request.unique_key}"
+            message = f"{type(error).__name__}: {error}"
+            self.failures[original_url] = message
             self.broker.observe(request_key, success=False, quality=0.0)
             context.log.error(f"Browser render failed: {context.request.url}: {error}")
 
