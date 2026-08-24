@@ -48,6 +48,22 @@ class _Fetcher:
         return self.records
 
 
+def _record(
+    url: str,
+    *,
+    title: str | None = None,
+    links: tuple[str, ...] = (),
+) -> PageRecord:
+    return PageRecord(
+        url=url,
+        status_code=200,
+        content_type="text/html",
+        title=title,
+        links=links,
+        metadata={"requested_url": url},
+    )
+
+
 @pytest.mark.asyncio
 async def test_worker_persists_discovers_then_acks() -> None:
     frontier = MemoryFrontier()
@@ -58,16 +74,7 @@ async def test_worker_persists_discovers_then_acks() -> None:
     worker = CrawlWorker(
         frontier,
         store,
-        _Fetcher(
-            [
-                PageRecord(
-                    url=seed,
-                    title="Root",
-                    links=(child,),
-                    metadata={"requested_url": seed},
-                )
-            ]
-        ),
+        _Fetcher([_record(seed, title="Root", links=(child,))]),
     )
 
     result = await worker.run_batch(
@@ -104,7 +111,7 @@ async def test_worker_leaves_lease_recoverable_when_persistence_raises() -> None
     worker = CrawlWorker(
         frontier,
         _Store(fail=True),
-        _Fetcher([PageRecord(url=seed, metadata={"requested_url": seed})]),
+        _Fetcher([_record(seed)]),
     )
 
     with pytest.raises(RuntimeError, match="storage unavailable"):
@@ -137,7 +144,7 @@ async def test_worker_leaves_lease_recoverable_when_post_persist_hook_raises() -
     worker = CrawlWorker(
         frontier,
         store,
-        _Fetcher([PageRecord(url=seed, metadata={"requested_url": seed})]),
+        _Fetcher([_record(seed)]),
         on_persisted=failing_hook,
     )
 
