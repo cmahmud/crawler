@@ -78,7 +78,7 @@ async def test_http_shell_escalates_to_browser(dynamic_site: str) -> None:
 
     record = await crawler.scrape(dynamic_site)
     assert record is not None
-    assert record.title == "Rendered Product"
-    assert record.engine == "browser"
+    assert record.engine == "browser", record.metadata
+    assert record.title == "Rendered Product", record.metadata
     assert record.metadata["rendered"] is True
     assert record.metadata["escalated_from"] == "http"
