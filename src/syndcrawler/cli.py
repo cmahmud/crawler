@@ -84,17 +84,19 @@ def build_parser() -> argparse.ArgumentParser:
 
     worker = subparsers.add_parser(
         "worker",
-        help="process active Redis/PostgreSQL server crawls",
+        help="process active crawls and scheduled recrawls",
     )
     worker.add_argument(
         "--once",
         action="store_true",
-        help="run one active-crawl sweep and exit",
+        help="run one initial-work and recrawl sweep, then exit",
     )
     worker.add_argument("--poll-interval", type=float)
     worker.add_argument("--error-backoff", type=float)
     worker.add_argument("--max-crawls", type=int, default=100)
     worker.add_argument("--per-crawl-limit", type=int)
+    worker.add_argument("--recrawl-limit", type=int)
+    worker.add_argument("--recrawl-lease-seconds", type=float)
     worker.add_argument(
         "--log-level",
         choices=["critical", "error", "warning", "info", "debug"],
@@ -182,7 +184,12 @@ async def _run_server(args: argparse.Namespace) -> int:
 
 async def _run_worker(args: argparse.Namespace) -> int:
     from syndcrawler.runtime.daemon import run_worker_loop
-    from syndcrawler.runtime.server_env import env_float, server_runtime_from_env
+    from syndcrawler.runtime.server_env import (
+        env_float,
+        env_int,
+        server_runtime_from_env,
+    )
+    from syndcrawler.runtime.server_recrawl import ServerRecrawlScheduler
 
     logging.basicConfig(level=getattr(logging, args.log_level.upper()))
     poll_interval = (
@@ -195,6 +202,16 @@ async def _run_worker(args: argparse.Namespace) -> int:
         if args.error_backoff is not None
         else env_float("SYNCRAWLER_WORKER_ERROR_BACKOFF", 5.0, minimum=0.001)
     )
+    recrawl_limit = (
+        args.recrawl_limit
+        if args.recrawl_limit is not None
+        else env_int("SYNCRAWLER_RECRAWL_BATCH_SIZE", 100, minimum=1)
+    )
+    recrawl_lease_seconds = (
+        args.recrawl_lease_seconds
+        if args.recrawl_lease_seconds is not None
+        else env_float("SYNCRAWLER_RECRAWL_LEASE_SECONDS", 120.0, minimum=0.001)
+    )
     runtime = await server_runtime_from_env()
     try:
         if args.once:
@@ -202,7 +219,15 @@ async def _run_worker(args: argparse.Namespace) -> int:
                 max_crawls=args.max_crawls,
                 per_crawl_limit=args.per_crawl_limit,
             )
-            print(json.dumps(_sweep_summary(sweep), indent=2))
+            recrawl = await ServerRecrawlScheduler(
+                runtime.store,
+                runtime.config,
+                policy=runtime.recrawl_policy,
+            ).run_once(
+                limit=recrawl_limit,
+                lease_seconds=recrawl_lease_seconds,
+            )
+            print(json.dumps(_sweep_summary(sweep, recrawl), indent=2))
             return 0
         await run_worker_loop(
             runtime,
@@ -210,6 +235,8 @@ async def _run_worker(args: argparse.Namespace) -> int:
             error_backoff_seconds=error_backoff,
             max_crawls=args.max_crawls,
             per_crawl_limit=args.per_crawl_limit,
+            recrawl_limit=recrawl_limit,
+            recrawl_lease_seconds=recrawl_lease_seconds,
         )
         return 0
     finally:
@@ -279,13 +306,20 @@ def _recrawl_summary(result) -> dict[str, object]:
     }
 
 
-def _sweep_summary(result) -> dict[str, int]:
+def _sweep_summary(result, recrawl) -> dict[str, int]:
     return {
         "crawls_seen": result.crawls_seen,
         "leased": result.leased,
         "persisted": result.persisted,
         "failed": result.failed,
         "discovered": result.discovered,
+        "recrawl_claimed": recrawl.claimed,
+        "recrawl_checked": recrawl.checked,
+        "recrawl_not_modified": recrawl.not_modified,
+        "recrawl_unchanged": recrawl.unchanged,
+        "recrawl_representation_changed": recrawl.representation_changed,
+        "recrawl_semantic_changed": recrawl.semantic_changed,
+        "recrawl_failures": recrawl.failures,
     }
 
 
