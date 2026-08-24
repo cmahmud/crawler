@@ -5,6 +5,7 @@ from datetime import timedelta
 from pathlib import Path
 
 from syndcrawler.config import CrawlConfig
+from syndcrawler.core.change import fingerprint_page
 from syndcrawler.core.egress import EgressPolicy, UnsafeTargetError
 from syndcrawler.core.policy import FetchAction, FetchEngine, NetworkRoute
 from syndcrawler.core.routes import ProxyMode, ProxyPool, RouteBroker
@@ -157,7 +158,16 @@ class BrowserRenderer:
             links = await self._safe_links(parsed.links, seed_urls)
             self.broker.observe(request_key, success=True, quality=1.0 if html else 0.25)
 
-            content_type = context.response.headers.get("content-type")
+            response_headers = context.response.headers
+            content_type = response_headers.get("content-type")
+            structured = parsed.structured.to_dict()
+            fingerprint = fingerprint_page(
+                html,
+                title=parsed.title,
+                links=parsed.links,
+                structured=structured,
+                headers=response_headers,
+            )
             record = PageRecord(
                 url=source_url,
                 status_code=status_code,
@@ -169,7 +179,8 @@ class BrowserRenderer:
                 metadata={
                     "rendered": True,
                     "requested_url": original_url,
-                    "structured": parsed.structured.to_dict(),
+                    "structured": structured,
+                    "fingerprint": fingerprint.to_dict(),
                 },
             )
             records[original_url] = record
