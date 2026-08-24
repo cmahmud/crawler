@@ -14,6 +14,7 @@ from syndcrawler.runtime.worker import CrawlWorker, WorkerBatchResult
 from syndcrawler.storage import CrawlManifest, PostgresCrawlStore, RedisFrontier
 
 _SITEMAP_PRIORITY = -10
+_CANCELLED_FRONTIER_TTL_SECONDS = 86_400
 _EMPTY_BATCH = WorkerBatchResult(leased=0, persisted=0, failed=0, discovered=0)
 
 
@@ -217,7 +218,7 @@ class ServerRuntime:
         lifecycle = await self._lifecycle(crawl_id)
         if lifecycle != "cancelled":
             await self.store.set_lifecycle(crawl_id, "cancelled")
-            await self.frontier.purge(crawl_id)
+        await self._cleanup_cancelled_frontier(crawl_id)
         return await self.status(crawl_id)
 
     async def run_batch(
@@ -278,7 +279,11 @@ class ServerRuntime:
             ),
             namespace_prefix="server",
         )
-        await self._mark_completed_if_done(crawl_id, manifest)
+        lifecycle = await self._lifecycle(crawl_id)
+        if lifecycle == "cancelled":
+            await self._cleanup_cancelled_frontier(crawl_id)
+        else:
+            await self._mark_completed_if_done(crawl_id, manifest)
         return batch
 
     async def run_runnable_once(
@@ -339,6 +344,13 @@ class ServerRuntime:
         )
         if manifest.follow_links and self.config.sitemap_discovery_enabled:
             await self._seed_from_sitemaps(manifest)
+
+    async def _cleanup_cancelled_frontier(self, crawl_id: str) -> None:
+        stats = await self.frontier.stats(crawl_id)
+        if stats["leased"] == 0:
+            await self.frontier.purge(crawl_id)
+            return
+        await self.frontier.expire(crawl_id, _CANCELLED_FRONTIER_TTL_SECONDS)
 
     async def _mark_completed_if_done(
         self,
