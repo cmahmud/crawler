@@ -12,13 +12,13 @@
     "build": "mkdir -p dist && bun build --compile src/index.tsx --outfile dist/syndcrawler-tui"
   },
   "dependencies": {
-    "@opentui/core": "^0.5.3",
-    "@opentui/react": "^0.5.3",
-    "react": "^19.2.0"
+    "@opentui/core": "0.5.7",
+    "@opentui/react": "0.5.7",
+    "react": "19.2.8"
   },
   "devDependencies": {
-    "@types/bun": "latest",
-    "@types/react": "^19.2.0",
-    "typescript": "^5.8.0"
+    "@types/bun": "1.4.0",
+    "@types/react": "19.2.18",
+    "typescript": "5.9.3"
   }
 }
