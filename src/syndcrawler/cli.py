@@ -7,7 +7,7 @@ from pathlib import Path
 
 from syndcrawler.config import CrawlConfig
 from syndcrawler.core.routes import ProxyMode
-from syndcrawler.runtime import LocalCrawler, ResumableCrawler
+from syndcrawler.runtime import LocalCrawler, RecrawlRunner, ResumableCrawler
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -48,6 +48,20 @@ def build_parser() -> argparse.ArgumentParser:
     _add_state_dir_flag(resume)
     _add_fetch_flags(resume)
 
+    recrawl = subparsers.add_parser(
+        "recrawl",
+        help="conditionally refresh due resources in a durable crawl",
+    )
+    recrawl.add_argument("crawl_id")
+    recrawl.add_argument("--limit", type=int, default=100)
+    recrawl.add_argument(
+        "--force",
+        action="store_true",
+        help="refresh resources even when their next_fetch_at is in the future",
+    )
+    _add_state_dir_flag(recrawl)
+    _add_fetch_flags(recrawl, include_output=False)
+
     status = subparsers.add_parser(
         "status",
         help="show durable crawl state without fetching",
@@ -83,6 +97,16 @@ async def _run(args: argparse.Namespace) -> int:
             print(json.dumps(record.to_dict(), indent=2, ensure_ascii=False))
         return 0
 
+    if args.command == "recrawl":
+        runner = RecrawlRunner(config, state_dir=args.state_dir)
+        result = await runner.run(
+            args.crawl_id,
+            limit=args.limit,
+            force=args.force,
+        )
+        print(json.dumps(_recrawl_summary(result), indent=2))
+        return 0
+
     crawler = ResumableCrawler(config, state_dir=args.state_dir)
     if args.command == "crawl":
         result = await crawler.start(
@@ -94,11 +118,12 @@ async def _run(args: argparse.Namespace) -> int:
     else:
         result = await crawler.resume(args.crawl_id)
 
-    print(json.dumps(_run_summary(result, output=args.output), indent=2))
+    print(json.dumps(_run_summary(result, output=getattr(args, "output", None)), indent=2))
     return 0
 
 
 def _config_from_args(args: argparse.Namespace) -> CrawlConfig:
+    output = getattr(args, "output", None)
     return CrawlConfig(
         max_pages=getattr(args, "max_pages", 100),
         max_concurrency=args.concurrency,
@@ -121,7 +146,7 @@ def _config_from_args(args: argparse.Namespace) -> CrawlConfig:
         browser_navigation_timeout_seconds=args.browser_timeout,
         browser_settle_seconds=args.browser_settle_ms / 1000,
         browser_chromium_sandbox=not args.browser_no_sandbox,
-        output=Path(args.output) if args.output else None,
+        output=Path(output) if output else None,
     )
 
 
@@ -133,6 +158,30 @@ def _run_summary(result, *, output: str | None = None) -> dict[str, object]:
         "stats": result.stats,
         "state": str(result.state_path),
         "output": output,
+    }
+
+
+def _recrawl_summary(result) -> dict[str, object]:
+    return {
+        "crawl_id": result.crawl_id,
+        "checked": result.checked,
+        "not_modified": result.not_modified,
+        "unchanged": result.unchanged,
+        "representation_changed": result.representation_changed,
+        "semantic_changed": result.semantic_changed,
+        "failures": result.failures,
+        "items": [
+            {
+                "url": item.url,
+                "change_kind": (
+                    item.change_kind.value if item.change_kind is not None else None
+                ),
+                "status_code": item.status_code,
+                "next_fetch_at": item.next_fetch_at,
+                "error": item.error,
+            }
+            for item in result.items
+        ],
     }
 
 
@@ -155,10 +204,15 @@ def _add_discovery_flags(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--sitemap-max-urls", type=int, default=10_000)
 
 
-def _add_fetch_flags(parser: argparse.ArgumentParser) -> None:
+def _add_fetch_flags(
+    parser: argparse.ArgumentParser,
+    *,
+    include_output: bool = True,
+) -> None:
     parser.add_argument("--concurrency", type=int, default=10)
     parser.add_argument("--retries", type=int, default=2)
-    parser.add_argument("--output", help="write JSON or JSONL records to this path")
+    if include_output:
+        parser.add_argument("--output", help="write JSON or JSONL records to this path")
     parser.add_argument(
         "--proxy",
         action="append",
