@@ -6,7 +6,7 @@ import time
 import uuid
 from dataclasses import dataclass, field, replace
 from enum import StrEnum
-from typing import Any
+from typing import Any, Protocol
 
 from syndcrawler.core.url import canonicalize_url, hostname
 
@@ -48,6 +48,42 @@ class QueuePolicy:
     delay_seconds: float = 0.0
     blocked_until: float = 0.0
     crawl_limit: int | None = None
+
+
+class Frontier(Protocol):
+    """Storage-neutral frontier contract shared by local and distributed backends."""
+
+    async def add(self, *requests: FrontierRequest) -> int: ...
+
+    async def set_queue_policy(
+        self,
+        crawl_id: str,
+        queue_key: str,
+        policy: QueuePolicy,
+    ) -> None: ...
+
+    async def lease(
+        self,
+        crawl_id: str,
+        *,
+        limit: int = 1,
+        lease_seconds: float = 60.0,
+        now: float | None = None,
+    ) -> list[FrontierLease]: ...
+
+    async def ack(self, lease: FrontierLease) -> None: ...
+
+    async def retry(
+        self,
+        lease: FrontierLease,
+        *,
+        available_at: float,
+        error: str | None = None,
+    ) -> None: ...
+
+    async def fail(self, lease: FrontierLease, *, error: str) -> None: ...
+
+    async def stats(self, crawl_id: str) -> dict[str, int]: ...
 
 
 @dataclass(slots=True)
