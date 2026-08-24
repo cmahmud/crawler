@@ -172,7 +172,10 @@ def create_app(
             total=await runtime.store.manifest_count(),
             limit=limit,
             offset=offset,
-            items=[CrawlStatusResponse.model_validate(item, from_attributes=True) for item in items],
+            items=[
+                CrawlStatusResponse.model_validate(item, from_attributes=True)
+                for item in items
+            ],
         )
 
     @app.get(
