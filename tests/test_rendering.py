@@ -37,6 +37,28 @@ def test_dynamic_placeholder_shell_requests_browser() -> None:
     assert "dynamic-content-placeholder" in assessment.reasons
 
 
+def test_inline_document_write_shell_requests_browser() -> None:
+    assessment = assess_rendering(
+        """
+        <html><body>
+          <nav><a href="/">Quotes to Scrape</a><a href="/login">Login</a></nav>
+          <main></main>
+          <footer><p>Quotes by GoodReads.com. Made with care by Zyte.</p></footer>
+          <script>
+            var data = [{"text": "A quote", "author": {"name": "Author"}}];
+            for (var i in data) {
+              document.write('<div class="quote"><span class="text">' + data[i].text + '</span></div>');
+            }
+          </script>
+        </body></html>
+        """
+    )
+
+    assert assessment.visible_text_length < 200
+    assert assessment.requires_browser is True
+    assert "inline-dom-generation" in assessment.reasons
+
+
 def test_static_document_stays_on_http() -> None:
     assessment = assess_rendering(
         """
@@ -66,6 +88,26 @@ def test_short_static_page_with_scripts_stays_on_http_without_dynamic_container(
 
     assert assessment.requires_browser is False
     assert "dynamic-content-placeholder" not in assessment.reasons
+    assert "inline-dom-generation" not in assessment.reasons
+
+
+def test_short_static_page_with_inline_ui_script_stays_on_http() -> None:
+    assessment = assess_rendering(
+        """
+        <html><body><main>
+          <h1>Contact</h1>
+          <p>Email us for assistance.</p>
+        </main>
+        <script>
+          const button = document.querySelector('#menu');
+          if (button) button.addEventListener('click', () => console.log('open'));
+        </script>
+        </body></html>
+        """
+    )
+
+    assert assessment.requires_browser is False
+    assert "inline-dom-generation" not in assessment.reasons
 
 
 def test_ssr_framework_page_does_not_escalate_just_for_app_root() -> None:
