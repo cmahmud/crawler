@@ -2,14 +2,15 @@
 
 An adaptive, self-hostable crawler designed to run the same crawl logic on a laptop, a single VPS, or a distributed worker fleet.
 
-> Status: early alpha. The current vertical slice provides safe HTTP crawling, fast HTML parsing, optional proxy routing, deterministic HTTP-to-browser escalation, local frontier semantics, and transparent policy-learning primitives.
+> Status: early alpha. The current vertical slice provides safe HTTP crawling, fast HTML and structured-data parsing, optional proxy routing, deterministic HTTP-to-browser escalation, durable local crawl state, and transparent policy-learning primitives.
 
 ## Design goals
 
 - **Direct traffic is first-class.** Proxies are optional routes, never a requirement.
 - **Cheap fetch first.** HTTP is preferred until evidence says a page class needs browser rendering.
 - **Learn from outcomes.** Engine and network-route outcomes feed inspectable policy telemetry.
-- **Local and server deployment use the same contracts.** Local mode needs no Redis or database; durable backends can replace the frontier later.
+- **One kernel, multiple deployments.** The same crawl semantics are intended to work embedded, locally, on one VPS, or across workers.
+- **Durable local crawling without external infrastructure.** SQLite provides crawl IDs, leases, dedupe, results, and resume support without Redis/Postgres.
 - **Safe egress by default.** Public HTTP(S) targets and proxy endpoints only unless private-network crawling is explicitly enabled.
 - **Polite crawling.** `robots.txt` compliance is on by default and frontier queues are host-affine.
 - **No access-control bypass.** Browser rendering is an extraction mechanism, not a CAPTCHA/challenge bypass mechanism.
@@ -21,6 +22,7 @@ An adaptive, self-hostable crawler designed to run the same crawl logic on a lap
 - Impit-backed HTTP by default through Crawlee
 - Selectolax Lexbor parser
 - optional Crawlee + Playwright browser rendering
+- SQLite durable local frontier/state store
 - Apache-2.0
 
 ## Install
@@ -42,19 +44,39 @@ A system Chrome/Chromium executable can also be selected with `--browser-executa
 
 ## CLI
 
-Fetch and parse a single page:
+Fetch and parse a single page without creating durable crawl state:
 
 ```bash
 syndcrawler scrape https://example.com
 ```
 
-Crawl up to 100 same-host pages:
+Start a durable same-host crawl:
 
 ```bash
 syndcrawler crawl https://example.com --max-pages 100
 ```
 
-Write records to JSONL:
+The command prints a crawl ID and stores state under `.syndcrawler/<crawl-id>.sqlite3`. Supply your own stable ID when useful:
+
+```bash
+syndcrawler crawl https://example.com --crawl-id example-crawl
+```
+
+Resume or inspect it later:
+
+```bash
+syndcrawler resume example-crawl
+syndcrawler status example-crawl
+```
+
+Use a different state directory:
+
+```bash
+syndcrawler crawl https://example.com --state-dir ./crawler-state
+syndcrawler resume example-crawl --state-dir ./crawler-state
+```
+
+Write the complete durable result set to JSONL:
 
 ```bash
 syndcrawler crawl https://example.com --max-pages 1000 --output results.jsonl
@@ -85,7 +107,23 @@ Robots compliance is enabled by default. Localhost/private-network destinations 
 syndcrawler scrape http://127.0.0.1:8000 --allow-private-networks --ignore-robots
 ```
 
+## Parsed evidence
+
+Every parsed HTML record can carry deterministic structured evidence without invoking AI:
+
+- canonical URL
+- JSON-LD payloads
+- OpenGraph values, including repeated properties such as multiple images
+- malformed JSON-LD count
+- title and discovered links
+- requested/final URL provenance
+- rendering assessment and selected fetch/network route
+
+Malformed embedded JSON-LD does not make the page fail.
+
 ## Python
+
+Ephemeral single-page usage:
 
 ```python
 import asyncio
@@ -101,11 +139,31 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
+Durable local usage:
+
+```python
+import asyncio
+
+from syndcrawler.runtime import ResumableCrawler
+
+async def main() -> None:
+    crawler = ResumableCrawler()
+    run = await crawler.start(["https://example.com"], max_pages=1000)
+    print(run.crawl_id, run.stats)
+
+    resumed = await crawler.resume(run.crawl_id)
+    print(resumed.completed)
+
+asyncio.run(main())
+```
+
 ## Runtime model
 
 ```text
 Embedded / local
     CLI or Python
+         |
+ durable SQLite frontier (crawl) / ephemeral request (scrape)
          |
     crawler kernel
          |
@@ -138,16 +196,16 @@ frontier -> policy -> fetch engine -> artifact -> parser/extractor -> validation
           page class     network route
 ```
 
-The in-memory frontier already models queue keys, priorities, leases, stale-work reclamation, per-queue concurrency, delays and crawl limits. This keeps local mode lightweight while giving Redis/SQL/distributed implementations a concrete compatibility target.
+The frontier contract models queue keys, priorities, leases, stale-work reclamation, per-queue concurrency, delays and crawl limits. `MemoryFrontier` provides a lightweight implementation; `SQLiteFrontier` persists the same semantics across process restarts. This gives later Redis/frontier-service backends a concrete compatibility target.
 
 The adaptive policy currently uses transparent EMA scoring. That is deliberate: we can benchmark and inspect it before replacing it with a more sophisticated contextual bandit or learned model.
 
 ## Near-term roadmap
 
-- persistent local frontier and resumable crawl IDs
-- Redis frontier backend for VPS workers
-- structured-data extraction and provenance artifacts
 - sitemap/feed/runtime-network discovery
+- conditional fetch + content/change detection for recrawls
+- Redis frontier backend for VPS workers
+- provenance artifact store and extraction validation
 - page-class learning and recrawl scheduling
 - benchmark corpus for engine/parser/frontier decisions
 - REST API + Docker deployment profile
