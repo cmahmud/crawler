@@ -1,13 +1,12 @@
 from __future__ import annotations
 
 import json
-import re
-import uuid
 from dataclasses import dataclass, replace
 from pathlib import Path
 
 from syndcrawler.config import CrawlConfig
 from syndcrawler.core.change import ChangeAssessment
+from syndcrawler.core.crawl import crawl_is_complete, new_crawl_id, validate_crawl_id
 from syndcrawler.core.frontier import FrontierRequest
 from syndcrawler.core.recrawl import RecrawlPolicy
 from syndcrawler.discovery import SitemapDiscoveryClient
@@ -16,7 +15,6 @@ from syndcrawler.runtime.local import LocalCrawler
 from syndcrawler.runtime.worker import CrawlWorker
 from syndcrawler.storage import CrawlManifest, SQLiteCrawlStore, SQLiteFrontier
 
-_CRAWL_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _SITEMAP_PRIORITY = -10
 
 
@@ -58,8 +56,7 @@ class ResumableCrawler:
     ) -> CrawlRunResult:
         if not seeds:
             raise ValueError("at least one seed is required")
-        crawl_id = crawl_id or f"cr_{uuid.uuid4().hex[:16]}"
-        _validate_crawl_id(crawl_id)
+        crawl_id = validate_crawl_id(crawl_id or new_crawl_id())
         page_limit = max_pages or self.config.max_pages
 
         fetcher = LocalCrawler(replace(self.config, output=None))
@@ -98,7 +95,7 @@ class ResumableCrawler:
         return await self.resume(crawl_id)
 
     async def resume(self, crawl_id: str) -> CrawlRunResult:
-        _validate_crawl_id(crawl_id)
+        crawl_id = validate_crawl_id(crawl_id)
         path = self.state_path(crawl_id)
         if not path.exists():
             raise ValueError(f"crawl state does not exist: {crawl_id}")
@@ -120,7 +117,7 @@ class ResumableCrawler:
             await self._run_until_idle(frontier, store, fetcher, manifest)
             stats = await frontier.stats(crawl_id)
             records = tuple(await store.results(crawl_id))
-            completed = _is_complete(stats, manifest.max_pages)
+            completed = crawl_is_complete(stats, manifest.max_pages)
         finally:
             await store.close()
             await frontier.close()
@@ -136,7 +133,7 @@ class ResumableCrawler:
         )
 
     async def status(self, crawl_id: str) -> CrawlRunResult:
-        _validate_crawl_id(crawl_id)
+        crawl_id = validate_crawl_id(crawl_id)
         path = self.state_path(crawl_id)
         if not path.exists():
             raise ValueError(f"crawl state does not exist: {crawl_id}")
@@ -156,12 +153,11 @@ class ResumableCrawler:
             state_path=path,
             records=records,
             stats=stats,
-            completed=_is_complete(stats, manifest.max_pages),
+            completed=crawl_is_complete(stats, manifest.max_pages),
         )
 
     def state_path(self, crawl_id: str) -> Path:
-        _validate_crawl_id(crawl_id)
-        return self.state_dir / f"{crawl_id}.sqlite3"
+        return self.state_dir / f"{validate_crawl_id(crawl_id)}.sqlite3"
 
     async def _seed_from_sitemaps(
         self,
@@ -259,18 +255,6 @@ class ResumableCrawler:
             )
             if batch.idle:
                 return
-
-
-def _is_complete(stats: dict[str, int], max_pages: int) -> bool:
-    terminal = stats["done"] + stats["failed"]
-    return terminal >= max_pages or (stats["queued"] == 0 and stats["leased"] == 0)
-
-
-def _validate_crawl_id(crawl_id: str) -> None:
-    if not _CRAWL_ID_RE.fullmatch(crawl_id):
-        raise ValueError(
-            "crawl_id must be 1-128 characters using letters, numbers, '.', '_' or '-'"
-        )
 
 
 def _write_records(path: Path, records: tuple[PageRecord, ...]) -> None:
