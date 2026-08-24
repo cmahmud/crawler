@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import os
 import uuid
 
@@ -36,6 +37,20 @@ def _record(body: bytes, *, title: str, etag: str) -> PageRecord:
         links=("https://example.com/child",),
         metadata={"fingerprint": fingerprint.to_dict()},
     )
+
+
+@pytest.mark.asyncio
+async def test_postgres_store_concurrent_initialization_is_safe() -> None:
+    first, second = await asyncio.gather(
+        PostgresCrawlStore.from_dsn(_postgres_dsn(), min_size=1, max_size=1),
+        PostgresCrawlStore.from_dsn(_postgres_dsn(), min_size=1, max_size=1),
+    )
+    try:
+        assert await first.ping() is True
+        assert await second.ping() is True
+    finally:
+        await first.close()
+        await second.close()
 
 
 @pytest.mark.asyncio
