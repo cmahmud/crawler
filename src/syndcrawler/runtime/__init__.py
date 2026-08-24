@@ -6,6 +6,7 @@ if TYPE_CHECKING:
     from syndcrawler.runtime.local import LocalCrawler
     from syndcrawler.runtime.recrawl import RecrawlItemResult, RecrawlRunner, RecrawlRunResult
     from syndcrawler.runtime.resumable import CrawlRunResult, ResumableCrawler
+    from syndcrawler.runtime.server import ServerCrawlStatus, ServerRuntime
     from syndcrawler.runtime.worker import CrawlWorker, WorkerBatchResult
 
 __all__ = [
@@ -16,6 +17,8 @@ __all__ = [
     "RecrawlRunResult",
     "RecrawlRunner",
     "ResumableCrawler",
+    "ServerCrawlStatus",
+    "ServerRuntime",
     "WorkerBatchResult",
 ]
 
@@ -45,6 +48,13 @@ def __getattr__(name: str) -> Any:
             "RecrawlItemResult": RecrawlItemResult,
             "RecrawlRunResult": RecrawlRunResult,
             "RecrawlRunner": RecrawlRunner,
+        }[name]
+    if name in {"ServerCrawlStatus", "ServerRuntime"}:
+        from syndcrawler.runtime.server import ServerCrawlStatus, ServerRuntime
+
+        return {
+            "ServerCrawlStatus": ServerCrawlStatus,
+            "ServerRuntime": ServerRuntime,
         }[name]
     if name in {"CrawlWorker", "WorkerBatchResult"}:
         from syndcrawler.runtime.worker import CrawlWorker, WorkerBatchResult
