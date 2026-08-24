@@ -20,6 +20,10 @@ class CrawlConfig:
     allow_private_networks: bool = False
     proxy_urls: tuple[str, ...] = ()
     proxy_mode: ProxyMode = ProxyMode.AUTO
+    sitemap_discovery_enabled: bool = True
+    sitemap_max_documents: int = 32
+    sitemap_max_depth: int = 4
+    sitemap_max_urls: int = 10_000
     browser_enabled: bool = False
     browser_type: str = "chromium"
     browser_executable_path: Path | None = None
@@ -38,6 +42,12 @@ class CrawlConfig:
             raise ValueError("max_retries cannot be negative")
         if self.proxy_mode is ProxyMode.REQUIRED and not self.proxy_urls:
             raise ValueError("proxy_mode='required' needs at least one proxy URL")
+        if self.sitemap_max_documents <= 0:
+            raise ValueError("sitemap_max_documents must be positive")
+        if self.sitemap_max_depth < 0:
+            raise ValueError("sitemap_max_depth cannot be negative")
+        if self.sitemap_max_urls <= 0:
+            raise ValueError("sitemap_max_urls must be positive")
         if self.browser_type not in _BROWSER_TYPES:
             raise ValueError(f"unsupported browser_type: {self.browser_type}")
         if self.browser_max_concurrency <= 0:
