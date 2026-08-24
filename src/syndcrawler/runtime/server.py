@@ -14,22 +14,33 @@ from syndcrawler.runtime.worker import CrawlWorker, WorkerBatchResult
 from syndcrawler.storage import CrawlManifest, PostgresCrawlStore, RedisFrontier
 
 _SITEMAP_PRIORITY = -10
+_EMPTY_BATCH = WorkerBatchResult(leased=0, persisted=0, failed=0, discovered=0)
 
 
 @dataclass(frozen=True, slots=True)
 class ServerCrawlStatus:
     crawl_id: str
+    lifecycle: str
     result_count: int
     stats: dict[str, int]
     completed: bool
+
+
+@dataclass(frozen=True, slots=True)
+class WorkerSweepResult:
+    crawls_seen: int
+    leased: int
+    persisted: int
+    failed: int
+    discovered: int
 
 
 class ServerRuntime:
     """Single-VPS or multi-worker runtime backed by Redis and PostgreSQL.
 
     Redis owns work leasing, host-affine politeness and the atomic crawl-wide page
-    budget. PostgreSQL owns manifests, latest records, validators and recrawl state.
-    Any number of runtime instances can call `run_batch()` for the same crawl.
+    budget. PostgreSQL owns manifests, lifecycle, latest records, validators and
+    recrawl state. Any number of runtime instances can sweep the same active crawls.
     """
 
     def __init__(
@@ -85,6 +96,19 @@ class ServerRuntime:
         finally:
             await self.store.close()
 
+    async def health(self) -> dict[str, bool]:
+        postgres_ok = await self.store.ping()
+        try:
+            await self.frontier.stats("healthcheck")
+            redis_ok = True
+        except Exception:
+            redis_ok = False
+        return {
+            "ok": postgres_ok and redis_ok,
+            "postgres": postgres_ok,
+            "redis": redis_ok,
+        }
+
     async def submit(
         self,
         seeds: list[str],
@@ -118,35 +142,73 @@ class ServerRuntime:
                 max_pages=page_limit,
             )
 
-        await self.frontier.set_crawl_limit(crawl_id, manifest.max_pages)
-        await self.frontier.add(
-            *(
-                FrontierRequest(
-                    seed,
-                    crawl_id=crawl_id,
-                    metadata={"seed": True},
-                )
-                for seed in manifest.seeds
-            )
-        )
-        if manifest.follow_links and self.config.sitemap_discovery_enabled:
-            await self._seed_from_sitemaps(manifest)
+        lifecycle = await self._lifecycle(crawl_id)
+        if lifecycle == "active":
+            await self._repair_frontier(manifest)
         return await self.status(crawl_id)
 
     async def status(self, crawl_id: str) -> ServerCrawlStatus:
         crawl_id = validate_crawl_id(crawl_id)
-        manifest = await self._manifest(crawl_id)
+        await self._manifest(crawl_id)
+        lifecycle = await self._lifecycle(crawl_id)
         stats = await self.frontier.stats(crawl_id)
         return ServerCrawlStatus(
             crawl_id=crawl_id,
+            lifecycle=lifecycle,
             result_count=await self.store.result_count(crawl_id),
             stats=stats,
-            completed=crawl_is_complete(stats, manifest.max_pages),
+            completed=lifecycle == "completed",
         )
 
     async def results(self, crawl_id: str) -> list[PageRecord]:
         await self._manifest(validate_crawl_id(crawl_id))
         return await self.store.results(crawl_id)
+
+    async def results_page(
+        self,
+        crawl_id: str,
+        *,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[PageRecord]:
+        await self._manifest(validate_crawl_id(crawl_id))
+        return await self.store.results_page(crawl_id, limit=limit, offset=offset)
+
+    async def pause(self, crawl_id: str) -> ServerCrawlStatus:
+        crawl_id = validate_crawl_id(crawl_id)
+        await self._manifest(crawl_id)
+        lifecycle = await self._lifecycle(crawl_id)
+        if lifecycle == "completed":
+            raise ValueError(f"completed crawl cannot be paused: {crawl_id}")
+        if lifecycle == "cancelled":
+            raise ValueError(f"cancelled crawl cannot be paused: {crawl_id}")
+        if lifecycle != "paused":
+            await self.store.set_lifecycle(crawl_id, "paused")
+        return await self.status(crawl_id)
+
+    async def resume_crawl(self, crawl_id: str) -> ServerCrawlStatus:
+        crawl_id = validate_crawl_id(crawl_id)
+        manifest = await self._manifest(crawl_id)
+        lifecycle = await self._lifecycle(crawl_id)
+        if lifecycle == "completed":
+            raise ValueError(f"completed crawl cannot be resumed: {crawl_id}")
+        if lifecycle == "cancelled":
+            raise ValueError(f"cancelled crawl cannot be resumed: {crawl_id}")
+        if lifecycle != "active":
+            await self.store.set_lifecycle(crawl_id, "active")
+        await self._repair_frontier(manifest)
+        return await self.status(crawl_id)
+
+    async def cancel(self, crawl_id: str) -> ServerCrawlStatus:
+        crawl_id = validate_crawl_id(crawl_id)
+        await self._manifest(crawl_id)
+        lifecycle = await self._lifecycle(crawl_id)
+        if lifecycle == "completed":
+            raise ValueError(f"completed crawl cannot be cancelled: {crawl_id}")
+        if lifecycle != "cancelled":
+            await self.store.set_lifecycle(crawl_id, "cancelled")
+            await self.frontier.purge(crawl_id)
+        return await self.status(crawl_id)
 
     async def run_batch(
         self,
@@ -156,6 +218,8 @@ class ServerRuntime:
     ) -> WorkerBatchResult:
         crawl_id = validate_crawl_id(crawl_id)
         manifest = await self._manifest(crawl_id)
+        if await self._lifecycle(crawl_id) != "active":
+            return _EMPTY_BATCH
         await self.frontier.set_crawl_limit(crawl_id, manifest.max_pages)
         fetcher = LocalCrawler(
             replace(
@@ -193,7 +257,7 @@ class ServerRuntime:
             fetcher,
             on_persisted=schedule_recrawl,
         )
-        return await worker.run_batch(
+        batch = await worker.run_batch(
             crawl_id,
             scope_urls=manifest.seeds,
             follow_links=manifest.follow_links,
@@ -204,12 +268,36 @@ class ServerRuntime:
             ),
             namespace_prefix="server",
         )
+        await self._mark_completed_if_done(crawl_id, manifest)
+        return batch
+
+    async def run_runnable_once(
+        self,
+        *,
+        max_crawls: int = 100,
+        per_crawl_limit: int | None = None,
+    ) -> WorkerSweepResult:
+        crawl_ids = await self.store.runnable_crawl_ids(limit=max_crawls)
+        leased = persisted = failed = discovered = 0
+        for crawl_id in crawl_ids:
+            batch = await self.run_batch(crawl_id, limit=per_crawl_limit)
+            leased += batch.leased
+            persisted += batch.persisted
+            failed += batch.failed
+            discovered += batch.discovered
+        return WorkerSweepResult(
+            crawls_seen=len(crawl_ids),
+            leased=leased,
+            persisted=persisted,
+            failed=failed,
+            discovered=discovered,
+        )
 
     async def run_until_idle(self, crawl_id: str) -> ServerCrawlStatus:
         crawl_id = validate_crawl_id(crawl_id)
         while True:
             status = await self.status(crawl_id)
-            if status.completed:
+            if status.lifecycle != "active":
                 return status
             batch = await self.run_batch(crawl_id)
             if batch.idle:
@@ -220,6 +308,38 @@ class ServerRuntime:
         if manifest is None:
             raise ValueError(f"crawl manifest does not exist: {crawl_id}")
         return manifest
+
+    async def _lifecycle(self, crawl_id: str) -> str:
+        lifecycle = await self.store.get_lifecycle(crawl_id)
+        if lifecycle is None:
+            raise ValueError(f"crawl manifest does not exist: {crawl_id}")
+        return lifecycle
+
+    async def _repair_frontier(self, manifest: CrawlManifest) -> None:
+        await self.frontier.set_crawl_limit(manifest.crawl_id, manifest.max_pages)
+        await self.frontier.add(
+            *(
+                FrontierRequest(
+                    seed,
+                    crawl_id=manifest.crawl_id,
+                    metadata={"seed": True},
+                )
+                for seed in manifest.seeds
+            )
+        )
+        if manifest.follow_links and self.config.sitemap_discovery_enabled:
+            await self._seed_from_sitemaps(manifest)
+
+    async def _mark_completed_if_done(
+        self,
+        crawl_id: str,
+        manifest: CrawlManifest,
+    ) -> None:
+        if await self._lifecycle(crawl_id) != "active":
+            return
+        stats = await self.frontier.stats(crawl_id)
+        if crawl_is_complete(stats, manifest.max_pages):
+            await self.store.set_lifecycle(crawl_id, "completed")
 
     async def _seed_from_sitemaps(self, manifest: CrawlManifest) -> None:
         discovery = SitemapDiscoveryClient(self.config)
