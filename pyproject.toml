@@ -26,7 +26,15 @@ classifiers = [
 [project.optional-dependencies]
 browser = ["crawlee[playwright]>=1.9,<2"]
 redis = ["redis>=5,<7"]
-server = ["redis>=5,<7"]
+postgres = [
+  "psycopg[binary]>=3.2,<4",
+  "psycopg-pool>=3.2,<4",
+]
+server = [
+  "redis>=5,<7",
+  "psycopg[binary]>=3.2,<4",
+  "psycopg-pool>=3.2,<4",
+]
 dev = [
   "pytest>=8.4,<9",
   "pytest-asyncio>=1.1,<2",
