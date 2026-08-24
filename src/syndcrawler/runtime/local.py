@@ -5,6 +5,7 @@ from dataclasses import replace
 from pathlib import Path
 
 from syndcrawler.config import CrawlConfig
+from syndcrawler.core.change import fingerprint_page
 from syndcrawler.core.egress import EgressPolicy, UnsafeTargetError
 from syndcrawler.core.policy import FetchAction, FetchEngine, NetworkRoute
 from syndcrawler.core.rendering import assess_rendering
@@ -115,6 +116,14 @@ class LocalCrawler:
             status_code = getattr(context.http_response, "status_code", None)
             headers = getattr(context.http_response, "headers", {})
             content_type = headers.get("content-type") if hasattr(headers, "get") else None
+            structured = parsed.structured.to_dict()
+            fingerprint = fingerprint_page(
+                body,
+                title=parsed.title,
+                links=parsed.links,
+                structured=structured,
+                headers=headers,
+            )
 
             selected = broker.selected_action(context.request.unique_key) or _DIRECT_HTTP
             should_render = self.config.browser_enabled and rendering.requires_browser
@@ -134,7 +143,8 @@ class LocalCrawler:
                 route=selected.route.value,
                 metadata={
                     "requested_url": context.request.url,
-                    "structured": parsed.structured.to_dict(),
+                    "structured": structured,
+                    "fingerprint": fingerprint.to_dict(),
                     "rendering_assessment": {
                         "requires_browser": rendering.requires_browser,
                         "score": rendering.score,
