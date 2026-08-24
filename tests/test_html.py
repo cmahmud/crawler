@@ -25,7 +25,7 @@ def test_parse_html_extracts_navigation_and_structured_evidence() -> None:
     assert parsed.title == "Product"
     assert parsed.links == ("https://shop.example.com/next",)
     assert parsed.structured.canonical_url == (
-        "https://shop.example.com/products/widget?a=1&b=2"
+        "https://shop.example.com/products/widget?b=2&a=1"
     )
     assert parsed.structured.json_ld == (
         {
