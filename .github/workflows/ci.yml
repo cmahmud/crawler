@@ -78,7 +78,7 @@ jobs:
       - run: python -m pip install --upgrade pip
       - run: python -m pip install -e '.[postgres,dev]'
       - run: ruff check .
-      - run: pytest tests/test_postgres_crawl_store.py
+      - run: pytest tests/test_postgres_crawl_store.py tests/test_postgres_recrawl_claims.py
 
   server:
     runs-on: ubuntu-latest
@@ -117,7 +117,18 @@ jobs:
       - run: python -m pip install --upgrade pip
       - run: python -m pip install -e '.[server,dev]'
       - run: ruff check .
-      - run: pytest tests/test_server_runtime.py tests/test_control_plane_api.py
+      - run: >-
+          pytest tests/test_server_runtime.py tests/test_control_plane_api.py
+          tests/test_server_recrawl.py
+
+  deployment:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker compose config >/dev/null
+        env:
+          SYNCRAWLER_POSTGRES_PASSWORD: ci-postgres-password
+          SYNCRAWLER_API_TOKEN: ci-api-token
 
   browser:
     runs-on: ubuntu-latest
