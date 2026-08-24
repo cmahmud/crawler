@@ -17,6 +17,26 @@ async def server_runtime_from_env() -> ServerRuntime:
         allow_private_networks=env_bool("SYNCRAWLER_ALLOW_PRIVATE_NETWORKS", False),
         sitemap_discovery_enabled=env_bool("SYNCRAWLER_SITEMAP_DISCOVERY", True),
         browser_enabled=env_bool("SYNCRAWLER_BROWSER_ENABLED", False),
+        browser_type=os.environ.get("SYNCRAWLER_BROWSER_TYPE", "chromium"),
+        browser_max_concurrency=env_int(
+            "SYNCRAWLER_BROWSER_MAX_CONCURRENCY",
+            2,
+            minimum=1,
+        ),
+        browser_navigation_timeout_seconds=env_float(
+            "SYNCRAWLER_BROWSER_TIMEOUT_SECONDS",
+            45.0,
+            minimum=0.001,
+        ),
+        browser_settle_seconds=env_float(
+            "SYNCRAWLER_BROWSER_SETTLE_SECONDS",
+            0.25,
+            minimum=0.0,
+        ),
+        browser_chromium_sandbox=env_bool(
+            "SYNCRAWLER_BROWSER_CHROMIUM_SANDBOX",
+            True,
+        ),
     )
     return await ServerRuntime.from_urls(
         redis_url=required_env("SYNCRAWLER_REDIS_URL"),
