@@ -115,6 +115,7 @@ def _config_from_args(args: argparse.Namespace) -> CrawlConfig:
         browser_max_concurrency=args.browser_concurrency,
         browser_navigation_timeout_seconds=args.browser_timeout,
         browser_settle_seconds=args.browser_settle_ms / 1000,
+        browser_chromium_sandbox=not args.browser_no_sandbox,
         output=Path(args.output) if args.output else None,
     )
 
@@ -173,6 +174,11 @@ def _add_fetch_flags(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--browser-concurrency", type=int, default=2)
     parser.add_argument("--browser-timeout", type=float, default=45.0)
     parser.add_argument("--browser-settle-ms", type=float, default=250.0)
+    parser.add_argument(
+        "--browser-no-sandbox",
+        action="store_true",
+        help="disable the Chromium sandbox only when the host cannot provide one",
+    )
     parser.add_argument(
         "--ignore-robots",
         action="store_true",
