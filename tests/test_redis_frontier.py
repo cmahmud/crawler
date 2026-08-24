@@ -209,3 +209,61 @@ async def test_redis_frontier_retry_respects_available_at() -> None:
     finally:
         await frontier.purge(crawl_id)
         await frontier.close()
+
+
+@pytest.mark.asyncio
+async def test_redis_crawl_limit_is_atomic_across_clients() -> None:
+    prefix = f"syndcrawler-test:{uuid.uuid4().hex}"
+    first = RedisFrontier.from_url(_redis_url(), key_prefix=prefix)
+    second = RedisFrontier.from_url(_redis_url(), key_prefix=prefix)
+    crawl_id = "global-limit"
+    requests = [
+        FrontierRequest(f"https://budget{i}.example/page", crawl_id=crawl_id)
+        for i in range(10)
+    ]
+    try:
+        await first.set_crawl_limit(crawl_id, 3)
+        assert await first.add(*requests) == 10
+        left, right = await asyncio.gather(
+            first.lease(crawl_id, limit=5, now=100.0),
+            second.lease(crawl_id, limit=5, now=100.0),
+        )
+        leases = left + right
+        assert len(leases) == 3
+        assert len({lease.request.url for lease in leases}) == 3
+
+        await asyncio.gather(
+            *(first.ack(lease) for lease in left),
+            *(second.ack(lease) for lease in right),
+        )
+        assert await first.lease(crawl_id, limit=5, now=100.0) == []
+        assert (await first.stats(crawl_id))["queued"] == 7
+    finally:
+        await first.purge(crawl_id)
+        await first.close()
+        await second.close()
+
+
+@pytest.mark.asyncio
+async def test_redis_crawl_limit_allows_retry_after_budget_is_full() -> None:
+    frontier = _frontier()
+    crawl_id = "global-limit-retry"
+    try:
+        await frontier.set_crawl_limit(crawl_id, 1)
+        await frontier.add(
+            FrontierRequest("https://a.example/page", crawl_id=crawl_id),
+            FrontierRequest("https://b.example/page", crawl_id=crawl_id),
+        )
+        first = (await frontier.lease(crawl_id, limit=1, now=100.0))[0]
+        await frontier.retry(first, available_at=100.0, error="temporary")
+
+        retry = (await frontier.lease(crawl_id, limit=2, now=100.0))[0]
+        assert retry.request.url == first.request.url
+        assert retry.attempt == 2
+        await frontier.ack(retry)
+
+        assert await frontier.lease(crawl_id, limit=2, now=100.0) == []
+        assert (await frontier.stats(crawl_id))["queued"] == 1
+    finally:
+        await frontier.purge(crawl_id)
+        await frontier.close()
