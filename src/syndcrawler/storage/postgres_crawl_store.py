@@ -263,6 +263,37 @@ class PostgresCrawlStore:
             rows = await cursor.fetchall()
         return [str(row["crawl_id"]) for row in rows]
 
+    async def recent_crawl_ids(
+        self,
+        *,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> list[str]:
+        if limit <= 0 or limit > 1000:
+            raise ValueError("limit must be between 1 and 1000")
+        if offset < 0:
+            raise ValueError("offset cannot be negative")
+        async with self._pool.connection() as connection:
+            cursor = await connection.execute(
+                """
+                SELECT crawl_id FROM syndcrawler_manifests
+                ORDER BY updated_at DESC, crawl_id DESC
+                LIMIT %s OFFSET %s
+                """,
+                (limit, offset),
+            )
+            rows = await cursor.fetchall()
+        return [str(row["crawl_id"]) for row in rows]
+
+    async def manifest_count(self) -> int:
+        async with self._pool.connection() as connection:
+            cursor = await connection.execute(
+                "SELECT COUNT(*) AS count FROM syndcrawler_manifests"
+            )
+            row = await cursor.fetchone()
+        assert row is not None
+        return int(row["count"])
+
     async def put_result(
         self,
         crawl_id: str,
