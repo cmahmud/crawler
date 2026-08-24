@@ -7,7 +7,7 @@ from pathlib import Path
 
 from syndcrawler.config import CrawlConfig
 from syndcrawler.core.routes import ProxyMode
-from syndcrawler.runtime import LocalCrawler
+from syndcrawler.runtime import LocalCrawler, ResumableCrawler
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -19,30 +19,87 @@ def build_parser() -> argparse.ArgumentParser:
 
     scrape = subparsers.add_parser("scrape", help="fetch and parse one page")
     scrape.add_argument("url")
-    _add_common_flags(scrape, default_pages=1)
+    _add_fetch_flags(scrape)
 
     crawl = subparsers.add_parser(
         "crawl",
-        help="crawl a site starting from one or more seeds",
+        help="start a durable crawl from one or more seeds",
     )
     crawl.add_argument("urls", nargs="+")
-    _add_common_flags(crawl, default_pages=100)
+    crawl.add_argument("--max-pages", type=int, default=100)
     crawl.add_argument(
         "--cross-domain",
         action="store_true",
         help="follow links across hostnames",
     )
+    crawl.add_argument(
+        "--crawl-id",
+        help="optional durable crawl ID; generated automatically when omitted",
+    )
+    _add_state_dir_flag(crawl)
+    _add_fetch_flags(crawl)
+
+    resume = subparsers.add_parser(
+        "resume",
+        help="resume a durable crawl from its SQLite state",
+    )
+    resume.add_argument("crawl_id")
+    _add_state_dir_flag(resume)
+    _add_fetch_flags(resume)
+
+    status = subparsers.add_parser(
+        "status",
+        help="show durable crawl state without fetching",
+    )
+    status.add_argument("crawl_id")
+    _add_state_dir_flag(status)
     return parser
 
 
 def main(argv: list[str] | None = None) -> None:
-    args = build_parser().parse_args(argv)
-    raise SystemExit(asyncio.run(_run(args)))
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    try:
+        code = asyncio.run(_run(args))
+    except ValueError as exc:
+        parser.error(str(exc))
+    raise SystemExit(code)
 
 
 async def _run(args: argparse.Namespace) -> int:
-    config = CrawlConfig(
-        max_pages=args.max_pages,
+    if args.command == "status":
+        crawler = ResumableCrawler(state_dir=args.state_dir)
+        result = await crawler.status(args.crawl_id)
+        print(json.dumps(_run_summary(result), indent=2))
+        return 0
+
+    config = _config_from_args(args)
+
+    if args.command == "scrape":
+        crawler = LocalCrawler(config)
+        record = await crawler.scrape(args.url)
+        if record is not None:
+            print(json.dumps(record.to_dict(), indent=2, ensure_ascii=False))
+        return 0
+
+    crawler = ResumableCrawler(config, state_dir=args.state_dir)
+    if args.command == "crawl":
+        result = await crawler.start(
+            args.urls,
+            crawl_id=args.crawl_id,
+            follow_links=True,
+            max_pages=args.max_pages,
+        )
+    else:
+        result = await crawler.resume(args.crawl_id)
+
+    print(json.dumps(_run_summary(result, output=args.output), indent=2))
+    return 0
+
+
+def _config_from_args(args: argparse.Namespace) -> CrawlConfig:
+    return CrawlConfig(
+        max_pages=getattr(args, "max_pages", 100),
         max_concurrency=args.concurrency,
         max_retries=args.retries,
         same_domain=not getattr(args, "cross_domain", False),
@@ -60,21 +117,28 @@ async def _run(args: argparse.Namespace) -> int:
         browser_settle_seconds=args.browser_settle_ms / 1000,
         output=Path(args.output) if args.output else None,
     )
-    crawler = LocalCrawler(config)
-
-    if args.command == "scrape":
-        record = await crawler.scrape(args.url)
-        if record is not None:
-            print(json.dumps(record.to_dict(), indent=2, ensure_ascii=False))
-        return 0
-
-    records = await crawler.crawl(args.urls)
-    print(json.dumps({"pages": len(records), "output": args.output}, indent=2))
-    return 0
 
 
-def _add_common_flags(parser: argparse.ArgumentParser, *, default_pages: int) -> None:
-    parser.add_argument("--max-pages", type=int, default=default_pages)
+def _run_summary(result, *, output: str | None = None) -> dict[str, object]:
+    return {
+        "crawl_id": result.crawl_id,
+        "completed": result.completed,
+        "pages": len(result.records),
+        "stats": result.stats,
+        "state": str(result.state_path),
+        "output": output,
+    }
+
+
+def _add_state_dir_flag(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--state-dir",
+        default=".syndcrawler",
+        help="directory for durable crawl SQLite state",
+    )
+
+
+def _add_fetch_flags(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--concurrency", type=int, default=10)
     parser.add_argument("--retries", type=int, default=2)
     parser.add_argument("--output", help="write JSON or JSONL records to this path")
