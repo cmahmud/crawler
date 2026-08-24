@@ -44,6 +44,7 @@ async def test_postgres_store_persists_manifest_results_and_schedule() -> None:
     dsn = _postgres_dsn()
     first = await PostgresCrawlStore.from_dsn(dsn, min_size=1, max_size=2)
     try:
+        assert await first.ping() is True
         manifest = await first.create_manifest(
             crawl_id,
             ("https://example.com",),
@@ -53,6 +54,7 @@ async def test_postgres_store_persists_manifest_results_and_schedule() -> None:
             now=1.0,
         )
         assert manifest.crawl_id == crawl_id
+        assert await first.get_lifecycle(crawl_id) == "active"
 
         assessment = await first.put_result(
             crawl_id,
@@ -84,6 +86,7 @@ async def test_postgres_store_persists_manifest_results_and_schedule() -> None:
         assert manifest.seeds == ("https://example.com",)
         assert manifest.follow_links is True
         assert manifest.max_pages == 10
+        assert await second.get_lifecycle(crawl_id) == "active"
 
         state = await second.get_resource_state(
             crawl_id,
@@ -161,6 +164,70 @@ async def test_postgres_store_tracks_changes_and_not_modified() -> None:
         assert unchanged.last_changed_at == 4.0
         assert unchanged.change_count == 2
         assert unchanged.last_change_kind is ChangeKind.NOT_MODIFIED
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_postgres_store_lifecycle_and_runnable_query() -> None:
+    crawl_id = f"pg-{uuid.uuid4().hex}"
+    store = await PostgresCrawlStore.from_dsn(_postgres_dsn(), min_size=1, max_size=2)
+    try:
+        await store.create_manifest(
+            crawl_id,
+            ("https://example.com",),
+            follow_links=True,
+            same_domain=True,
+            max_pages=5,
+            now=1.0,
+        )
+        assert crawl_id in await store.runnable_crawl_ids(limit=1000)
+
+        assert await store.set_lifecycle(crawl_id, "paused", now=2.0) == "paused"
+        assert crawl_id not in await store.runnable_crawl_ids(limit=1000)
+
+        assert await store.set_lifecycle(crawl_id, "active", now=3.0) == "active"
+        assert crawl_id in await store.runnable_crawl_ids(limit=1000)
+
+        assert await store.set_lifecycle(crawl_id, "completed", now=4.0) == "completed"
+        assert crawl_id not in await store.runnable_crawl_ids(limit=1000)
+        with pytest.raises(ValueError, match="unsupported"):
+            await store.set_lifecycle(crawl_id, "unknown")
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_postgres_store_paginates_results() -> None:
+    crawl_id = f"pg-{uuid.uuid4().hex}"
+    store = await PostgresCrawlStore.from_dsn(_postgres_dsn(), min_size=1, max_size=2)
+    try:
+        await store.create_manifest(
+            crawl_id,
+            ("https://example.com",),
+            follow_links=False,
+            same_domain=True,
+            max_pages=3,
+            now=1.0,
+        )
+        for index in range(3):
+            await store.put_result(
+                crawl_id,
+                f"https://example.com/{index}",
+                _record(
+                    f"body-{index}".encode(),
+                    title=f"Product {index}",
+                    etag=f'"v{index}"',
+                ),
+                now=2.0 + index,
+            )
+
+        first = await store.results_page(crawl_id, limit=2, offset=0)
+        second = await store.results_page(crawl_id, limit=2, offset=2)
+        assert [record.title for record in first] == ["Product 0", "Product 1"]
+        assert [record.title for record in second] == ["Product 2"]
+        with pytest.raises(ValueError, match="between 1 and 1000"):
+            await store.results_page(crawl_id, limit=1001)
     finally:
         await store.close()
 
