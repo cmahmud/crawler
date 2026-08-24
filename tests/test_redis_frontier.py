@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import time
 import uuid
 
 import pytest
@@ -67,6 +68,35 @@ async def test_redis_frontier_deduplicates_and_orders_by_priority() -> None:
             "done": 2,
             "failed": 0,
         }
+    finally:
+        await frontier.purge(crawl_id)
+        await frontier.close()
+
+
+@pytest.mark.asyncio
+async def test_due_high_priority_is_not_hidden_by_large_ready_backlog() -> None:
+    frontier = _frontier()
+    crawl_id = "priority-promotion"
+    due_at = time.time() + 100
+    low_priority = [
+        FrontierRequest(
+            f"https://low{i}.example/page",
+            crawl_id=crawl_id,
+            priority=0,
+        )
+        for i in range(1200)
+    ]
+    high_priority = FrontierRequest(
+        "https://priority.example/page",
+        crawl_id=crawl_id,
+        priority=100,
+        available_at=due_at,
+    )
+    try:
+        assert await frontier.add(*low_priority, high_priority) == 1201
+        lease = (await frontier.lease(crawl_id, limit=1, now=due_at))[0]
+        assert lease.request.url == "https://priority.example/page"
+        await frontier.ack(lease)
     finally:
         await frontier.purge(crawl_id)
         await frontier.close()
