@@ -19,6 +19,24 @@ def test_empty_client_shell_requests_browser() -> None:
     assert "javascript-required-message" in assessment.reasons
 
 
+def test_dynamic_placeholder_shell_requests_browser() -> None:
+    assessment = assess_rendering(
+        """
+        <html><body>
+          <nav><a href="/">Quotes to Scrape</a><a href="/login">Login</a></nav>
+          <main><div id="quotesPlaceholder"></div></main>
+          <footer><p>Quotes by GoodReads.com. Made with care by Zyte.</p></footer>
+          <script src="/static/jquery.js"></script>
+          <script src="/static/main.js"></script>
+        </body></html>
+        """
+    )
+
+    assert assessment.visible_text_length < 200
+    assert assessment.requires_browser is True
+    assert "dynamic-content-placeholder" in assessment.reasons
+
+
 def test_static_document_stays_on_http() -> None:
     assessment = assess_rendering(
         """
@@ -31,6 +49,23 @@ def test_static_document_stays_on_http() -> None:
     )
 
     assert assessment.requires_browser is False
+
+
+def test_short_static_page_with_scripts_stays_on_http_without_dynamic_container() -> None:
+    assessment = assess_rendering(
+        """
+        <html><body><main>
+          <h1>About</h1>
+          <p>Short but complete server-rendered page.</p>
+        </main>
+        <script src="/analytics.js"></script>
+        <script src="/menu.js"></script>
+        </body></html>
+        """
+    )
+
+    assert assessment.requires_browser is False
+    assert "dynamic-content-placeholder" not in assessment.reasons
 
 
 def test_ssr_framework_page_does_not_escalate_just_for_app_root() -> None:
