@@ -39,6 +39,13 @@ class CrawlStatusResponse(BaseModel):
     completed: bool
 
 
+class CrawlsPageResponse(BaseModel):
+    total: int
+    limit: int
+    offset: int
+    items: list[CrawlStatusResponse]
+
+
 class ResultsPageResponse(BaseModel):
     crawl_id: str
     total: int
@@ -146,6 +153,29 @@ def create_app(
             crawl_id=payload.crawl_id,
             follow_links=payload.follow_links,
             max_pages=payload.max_pages,
+        )
+
+    @app.get(
+        "/v1/crawls",
+        response_model=CrawlsPageResponse,
+        dependencies=[Depends(require_auth)],
+    )
+    async def list_crawls(
+        request: Request,
+        limit: int = Query(default=50, ge=1, le=1000),
+        offset: int = Query(default=0, ge=0),
+    ) -> CrawlsPageResponse:
+        runtime = _runtime(request)
+        crawl_ids = await runtime.store.recent_crawl_ids(limit=limit, offset=offset)
+        items = [await runtime.status(crawl_id) for crawl_id in crawl_ids]
+        return CrawlsPageResponse(
+            total=await runtime.store.manifest_count(),
+            limit=limit,
+            offset=offset,
+            items=[
+                CrawlStatusResponse.model_validate(item, from_attributes=True)
+                for item in items
+            ],
         )
 
     @app.get(

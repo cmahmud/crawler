@@ -94,6 +94,9 @@ async def test_control_plane_requires_bearer_and_maps_lifecycle(api_target: str)
             )
             assert unauthenticated.status_code == 401
 
+            unauthenticated_list = await client.get("/v1/crawls")
+            assert unauthenticated_list.status_code == 401
+
             submitted = await client.post(
                 "/v1/crawls",
                 headers=headers,
@@ -106,6 +109,14 @@ async def test_control_plane_requires_bearer_and_maps_lifecycle(api_target: str)
             )
             assert submitted.status_code == 202
             assert submitted.json()["lifecycle"] == "active"
+
+            listed = await client.get("/v1/crawls?limit=10&offset=0", headers=headers)
+            assert listed.status_code == 200
+            listed_json = listed.json()
+            assert listed_json["total"] >= 1
+            assert listed_json["limit"] == 10
+            assert listed_json["offset"] == 0
+            assert crawl_id in {item["crawl_id"] for item in listed_json["items"]}
 
             status_response = await client.get(f"/v1/crawls/{crawl_id}", headers=headers)
             assert status_response.status_code == 200

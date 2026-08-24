@@ -4,6 +4,8 @@ import argparse
 import asyncio
 import json
 import logging
+import os
+import shutil
 from pathlib import Path
 
 from syndcrawler.config import CrawlConfig
@@ -70,6 +72,24 @@ def build_parser() -> argparse.ArgumentParser:
     status_parser.add_argument("crawl_id")
     _add_state_dir_flag(status_parser)
 
+    tui = subparsers.add_parser(
+        "tui",
+        help="launch the interactive OpenTUI server operator console",
+    )
+    tui.add_argument(
+        "--api-url",
+        help="override the control-plane base URL passed to the TUI",
+    )
+    tui.add_argument(
+        "--env-file",
+        default=".env",
+        help="load API token/bind/port from this env file before launch",
+    )
+    tui.add_argument(
+        "--binary",
+        help="explicit syndcrawler-tui executable path",
+    )
+
     serve = subparsers.add_parser(
         "serve",
         help="run the Redis/PostgreSQL HTTP control plane",
@@ -122,6 +142,9 @@ async def _run(args: argparse.Namespace) -> int:
         print(json.dumps(_run_summary(result), indent=2))
         return 0
 
+    if args.command == "tui":
+        return await _run_tui(args)
+
     if args.command == "serve":
         return await _run_server(args)
 
@@ -160,6 +183,55 @@ async def _run(args: argparse.Namespace) -> int:
 
     print(json.dumps(_run_summary(result, output=getattr(args, "output", None)), indent=2))
     return 0
+
+
+async def _run_tui(args: argparse.Namespace) -> int:
+    env = os.environ.copy()
+    env_file = Path(args.env_file)
+    if env_file.is_file():
+        env.update(_read_env_file(env_file))
+    if args.api_url:
+        env["SYNCRAWLER_TUI_API_URL"] = args.api_url
+
+    candidates: list[Path] = []
+    if args.binary:
+        candidates.append(Path(args.binary).expanduser())
+    discovered = shutil.which("syndcrawler-tui")
+    if discovered:
+        candidates.append(Path(discovered))
+    source_binary = Path(__file__).resolve().parents[2] / "tui" / "dist" / "syndcrawler-tui"
+    candidates.append(source_binary)
+
+    binary = next((path for path in candidates if path.is_file()), None)
+    if binary is None:
+        raise RuntimeError(
+            "SyndCrawler TUI binary is not installed. From a source checkout run "
+            "`./tui/build.sh`, then retry `syndcrawler tui`, or pass --binary PATH."
+        )
+
+    process = await asyncio.create_subprocess_exec(str(binary), env=env)
+    return await process.wait()
+
+
+def _read_env_file(path: Path) -> dict[str, str]:
+    values: dict[str, str] = {}
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[7:].lstrip()
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+        if not key:
+            continue
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+            value = value[1:-1]
+        values[key] = value
+    return values
 
 
 async def _run_server(args: argparse.Namespace) -> int:

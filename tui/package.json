@@ -1,0 +1,24 @@
+{
+  "name": "syndcrawler-tui",
+  "version": "0.2.0-alpha.1",
+  "private": true,
+  "type": "module",
+  "module": "src/index.tsx",
+  "scripts": {
+    "dev": "bun run src/index.tsx",
+    "typecheck": "tsc --noEmit",
+    "test": "bun test src/*.test.ts",
+    "check": "bun run typecheck && bun run test",
+    "build": "mkdir -p dist && bun build --compile src/index.tsx --outfile dist/syndcrawler-tui"
+  },
+  "dependencies": {
+    "@opentui/core": "0.5.7",
+    "@opentui/react": "0.5.7",
+    "react": "19.2.8"
+  },
+  "devDependencies": {
+    "@types/bun": "1.4.0",
+    "@types/react": "19.2.18",
+    "typescript": "5.9.3"
+  }
+}
