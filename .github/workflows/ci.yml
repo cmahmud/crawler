@@ -129,6 +129,8 @@ jobs:
         env:
           SYNCRAWLER_POSTGRES_PASSWORD: ci-postgres-password
           SYNCRAWLER_API_TOKEN: ci-api-token
+      - run: docker build --tag syndcrawler-ci .
+      - run: docker run --rm syndcrawler-ci syndcrawler --help
 
   browser:
     runs-on: ubuntu-latest
