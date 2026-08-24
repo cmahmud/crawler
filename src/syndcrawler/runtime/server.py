@@ -190,8 +190,6 @@ class ServerRuntime:
         crawl_id = validate_crawl_id(crawl_id)
         await self._manifest(crawl_id)
         lifecycle = await self._lifecycle(crawl_id)
-        if lifecycle == "completed":
-            raise CrawlStateError(f"completed crawl cannot be paused: {crawl_id}")
         if lifecycle == "cancelled":
             raise CrawlStateError(f"cancelled crawl cannot be paused: {crawl_id}")
         if lifecycle != "paused":
@@ -202,21 +200,21 @@ class ServerRuntime:
         crawl_id = validate_crawl_id(crawl_id)
         manifest = await self._manifest(crawl_id)
         lifecycle = await self._lifecycle(crawl_id)
-        if lifecycle == "completed":
-            raise CrawlStateError(f"completed crawl cannot be resumed: {crawl_id}")
         if lifecycle == "cancelled":
             raise CrawlStateError(f"cancelled crawl cannot be resumed: {crawl_id}")
-        if lifecycle != "active":
-            await self.store.set_lifecycle(crawl_id, "active")
-        await self._repair_frontier(manifest)
+        if lifecycle == "paused":
+            stats = await self.frontier.stats(crawl_id)
+            target = "completed" if crawl_is_complete(stats, manifest.max_pages) else "active"
+            await self.store.set_lifecycle(crawl_id, target)
+            lifecycle = target
+        if lifecycle == "active":
+            await self._repair_frontier(manifest)
         return await self.status(crawl_id)
 
     async def cancel(self, crawl_id: str) -> ServerCrawlStatus:
         crawl_id = validate_crawl_id(crawl_id)
         await self._manifest(crawl_id)
         lifecycle = await self._lifecycle(crawl_id)
-        if lifecycle == "completed":
-            raise CrawlStateError(f"completed crawl cannot be cancelled: {crawl_id}")
         if lifecycle != "cancelled":
             await self.store.set_lifecycle(crawl_id, "cancelled")
             await self.frontier.purge(crawl_id)
