@@ -28,6 +28,8 @@ CREATE INDEX IF NOT EXISTS idx_syndcrawler_recrawl_claims_expiry
 ON syndcrawler_recrawl_claims(expires_at, crawl_id, request_url)
 """
 
+_SCHEMA_LOCK_SQL = "SELECT pg_advisory_xact_lock(187003, 1)"
+
 
 @dataclass(frozen=True, slots=True)
 class RecrawlClaim:
@@ -57,6 +59,10 @@ class PostgresRecrawlClaims:
                 return
             async with self.store._pool.connection() as connection:
                 async with connection.transaction():
+                    # `CREATE TABLE IF NOT EXISTS` can still race in PostgreSQL's
+                    # system catalog when separate processes create the same table
+                    # simultaneously. Serialize only this one-time migration step.
+                    await connection.execute(_SCHEMA_LOCK_SQL)
                     await connection.execute(_SCHEMA)
                     await connection.execute(_INDEX)
             self._initialized = True
