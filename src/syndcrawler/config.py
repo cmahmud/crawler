@@ -26,6 +26,7 @@ class CrawlConfig:
     browser_max_concurrency: int = 2
     browser_navigation_timeout_seconds: float = 45.0
     browser_settle_seconds: float = 0.25
+    browser_chromium_sandbox: bool = True
     output: Path | None = None
 
     def __post_init__(self) -> None:
