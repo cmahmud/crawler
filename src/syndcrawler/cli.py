@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import logging
 from pathlib import Path
 
 from syndcrawler.config import CrawlConfig
@@ -62,12 +63,43 @@ def build_parser() -> argparse.ArgumentParser:
     _add_state_dir_flag(recrawl)
     _add_fetch_flags(recrawl, include_output=False)
 
-    status = subparsers.add_parser(
+    status_parser = subparsers.add_parser(
         "status",
         help="show durable crawl state without fetching",
     )
-    status.add_argument("crawl_id")
-    _add_state_dir_flag(status)
+    status_parser.add_argument("crawl_id")
+    _add_state_dir_flag(status_parser)
+
+    serve = subparsers.add_parser(
+        "serve",
+        help="run the Redis/PostgreSQL HTTP control plane",
+    )
+    serve.add_argument("--host", default="127.0.0.1")
+    serve.add_argument("--port", type=int, default=8080)
+    serve.add_argument(
+        "--log-level",
+        choices=["critical", "error", "warning", "info", "debug", "trace"],
+        default="info",
+    )
+
+    worker = subparsers.add_parser(
+        "worker",
+        help="process active Redis/PostgreSQL server crawls",
+    )
+    worker.add_argument(
+        "--once",
+        action="store_true",
+        help="run one active-crawl sweep and exit",
+    )
+    worker.add_argument("--poll-interval", type=float)
+    worker.add_argument("--error-backoff", type=float)
+    worker.add_argument("--max-crawls", type=int, default=100)
+    worker.add_argument("--per-crawl-limit", type=int)
+    worker.add_argument(
+        "--log-level",
+        choices=["critical", "error", "warning", "info", "debug"],
+        default="info",
+    )
     return parser
 
 
@@ -76,7 +108,7 @@ def main(argv: list[str] | None = None) -> None:
     args = parser.parse_args(argv)
     try:
         code = asyncio.run(_run(args))
-    except ValueError as exc:
+    except (RuntimeError, ValueError) as exc:
         parser.error(str(exc))
     raise SystemExit(code)
 
@@ -87,6 +119,12 @@ async def _run(args: argparse.Namespace) -> int:
         result = await crawler.status(args.crawl_id)
         print(json.dumps(_run_summary(result), indent=2))
         return 0
+
+    if args.command == "serve":
+        return await _run_server(args)
+
+    if args.command == "worker":
+        return await _run_worker(args)
 
     config = _config_from_args(args)
 
@@ -120,6 +158,62 @@ async def _run(args: argparse.Namespace) -> int:
 
     print(json.dumps(_run_summary(result, output=getattr(args, "output", None)), indent=2))
     return 0
+
+
+async def _run_server(args: argparse.Namespace) -> int:
+    try:
+        import uvicorn
+    except ImportError as exc:
+        raise RuntimeError(
+            "server command requires `pip install 'syndcrawler[server]'`"
+        ) from exc
+
+    config = uvicorn.Config(
+        "syndcrawler.control_plane.api:create_app_from_env",
+        factory=True,
+        host=args.host,
+        port=args.port,
+        log_level=args.log_level,
+    )
+    server = uvicorn.Server(config)
+    await server.serve()
+    return 0 if server.started else 1
+
+
+async def _run_worker(args: argparse.Namespace) -> int:
+    from syndcrawler.runtime.daemon import run_worker_loop
+    from syndcrawler.runtime.server_env import env_float, server_runtime_from_env
+
+    logging.basicConfig(level=getattr(logging, args.log_level.upper()))
+    poll_interval = (
+        args.poll_interval
+        if args.poll_interval is not None
+        else env_float("SYNCRAWLER_WORKER_POLL_INTERVAL", 1.0, minimum=0.001)
+    )
+    error_backoff = (
+        args.error_backoff
+        if args.error_backoff is not None
+        else env_float("SYNCRAWLER_WORKER_ERROR_BACKOFF", 5.0, minimum=0.001)
+    )
+    runtime = await server_runtime_from_env()
+    try:
+        if args.once:
+            sweep = await runtime.run_runnable_once(
+                max_crawls=args.max_crawls,
+                per_crawl_limit=args.per_crawl_limit,
+            )
+            print(json.dumps(_sweep_summary(sweep), indent=2))
+            return 0
+        await run_worker_loop(
+            runtime,
+            poll_interval_seconds=poll_interval,
+            error_backoff_seconds=error_backoff,
+            max_crawls=args.max_crawls,
+            per_crawl_limit=args.per_crawl_limit,
+        )
+        return 0
+    finally:
+        await runtime.close()
 
 
 def _config_from_args(args: argparse.Namespace) -> CrawlConfig:
@@ -182,6 +276,16 @@ def _recrawl_summary(result) -> dict[str, object]:
             }
             for item in result.items
         ],
+    }
+
+
+def _sweep_summary(result) -> dict[str, int]:
+    return {
+        "crawls_seen": result.crawls_seen,
+        "leased": result.leased,
+        "persisted": result.persisted,
+        "failed": result.failed,
+        "discovered": result.discovered,
     }
 
 
