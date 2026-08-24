@@ -18,6 +18,8 @@ if TYPE_CHECKING:
     from psycopg import AsyncConnection
     from psycopg_pool import AsyncConnectionPool
 
+_LIFECYCLES = frozenset({"active", "paused", "cancelled", "completed"})
+
 _SCHEMA_STATEMENTS = (
     """
     CREATE TABLE IF NOT EXISTS syndcrawler_manifests (
@@ -26,9 +28,18 @@ _SCHEMA_STATEMENTS = (
         follow_links BOOLEAN NOT NULL,
         same_domain BOOLEAN NOT NULL,
         max_pages BIGINT NOT NULL CHECK (max_pages > 0),
+        lifecycle TEXT NOT NULL DEFAULT 'active',
         created_at DOUBLE PRECISION NOT NULL,
         updated_at DOUBLE PRECISION NOT NULL
     )
+    """,
+    """
+    ALTER TABLE syndcrawler_manifests
+    ADD COLUMN IF NOT EXISTS lifecycle TEXT NOT NULL DEFAULT 'active'
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_syndcrawler_manifests_lifecycle
+    ON syndcrawler_manifests(lifecycle, updated_at, crawl_id)
     """,
     """
     CREATE TABLE IF NOT EXISTS syndcrawler_results (
@@ -73,12 +84,7 @@ _SCHEMA_STATEMENTS = (
 
 
 class PostgresCrawlStore:
-    """Shared crawl metadata/result store for VPS and multi-worker deployments.
-
-    PostgreSQL owns durable crawl/result/change state while the Redis frontier owns
-    work leasing. Each result observation and its resource-state transition commit
-    in the same database transaction so workers can safely replay expired leases.
-    """
+    """Shared crawl metadata/result store for VPS and multi-worker deployments."""
 
     def __init__(
         self,
@@ -133,6 +139,12 @@ class PostgresCrawlStore:
                 for statement in _SCHEMA_STATEMENTS:
                     await connection.execute(statement)
 
+    async def ping(self) -> bool:
+        async with self._pool.connection() as connection:
+            cursor = await connection.execute("SELECT 1 AS ok")
+            row = await cursor.fetchone()
+        return row is not None and int(row["ok"]) == 1
+
     async def create_manifest(
         self,
         crawl_id: str,
@@ -165,8 +177,8 @@ class PostgresCrawlStore:
                         """
                         INSERT INTO syndcrawler_manifests (
                             crawl_id, seeds_json, follow_links, same_domain,
-                            max_pages, created_at, updated_at
-                        ) VALUES (%s, %s, %s, %s, %s, %s, %s)
+                            max_pages, lifecycle, created_at, updated_at
+                        ) VALUES (%s, %s, %s, %s, %s, 'active', %s, %s)
                         """,
                         (
                             crawl_id,
@@ -199,6 +211,57 @@ class PostgresCrawlStore:
             )
             row = await cursor.fetchone()
         return _manifest_from_row(row) if row is not None else None
+
+    async def get_lifecycle(self, crawl_id: str) -> str | None:
+        async with self._pool.connection() as connection:
+            cursor = await connection.execute(
+                "SELECT lifecycle FROM syndcrawler_manifests WHERE crawl_id = %s",
+                (crawl_id,),
+            )
+            row = await cursor.fetchone()
+        return str(row["lifecycle"]) if row is not None else None
+
+    async def set_lifecycle(
+        self,
+        crawl_id: str,
+        lifecycle: str,
+        *,
+        now: float | None = None,
+    ) -> str:
+        if lifecycle not in _LIFECYCLES:
+            raise ValueError(f"unsupported crawl lifecycle: {lifecycle}")
+        current = time.time() if now is None else now
+        async with self._pool.connection() as connection:
+            async with connection.transaction():
+                cursor = await connection.execute(
+                    """
+                    UPDATE syndcrawler_manifests
+                    SET lifecycle = %s, updated_at = %s
+                    WHERE crawl_id = %s
+                    RETURNING lifecycle
+                    """,
+                    (lifecycle, current, crawl_id),
+                )
+                row = await cursor.fetchone()
+                if row is None:
+                    raise ValueError(f"crawl manifest does not exist: {crawl_id}")
+        return str(row["lifecycle"])
+
+    async def runnable_crawl_ids(self, *, limit: int = 100) -> list[str]:
+        if limit <= 0:
+            raise ValueError("limit must be positive")
+        async with self._pool.connection() as connection:
+            cursor = await connection.execute(
+                """
+                SELECT crawl_id FROM syndcrawler_manifests
+                WHERE lifecycle = 'active'
+                ORDER BY updated_at ASC, crawl_id ASC
+                LIMIT %s
+                """,
+                (limit,),
+            )
+            rows = await cursor.fetchall()
+        return [str(row["crawl_id"]) for row in rows]
 
     async def put_result(
         self,
@@ -394,6 +457,30 @@ class PostgresCrawlStore:
                 ORDER BY recorded_at ASC, request_url ASC
                 """,
                 (crawl_id,),
+            )
+            rows = await cursor.fetchall()
+        return [_record_from_json(str(row["record_json"])) for row in rows]
+
+    async def results_page(
+        self,
+        crawl_id: str,
+        *,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[PageRecord]:
+        if limit <= 0 or limit > 1000:
+            raise ValueError("limit must be between 1 and 1000")
+        if offset < 0:
+            raise ValueError("offset cannot be negative")
+        async with self._pool.connection() as connection:
+            cursor = await connection.execute(
+                """
+                SELECT record_json FROM syndcrawler_results
+                WHERE crawl_id = %s
+                ORDER BY recorded_at ASC, request_url ASC
+                LIMIT %s OFFSET %s
+                """,
+                (crawl_id, limit, offset),
             )
             rows = await cursor.fetchall()
         return [_record_from_json(str(row["record_json"])) for row in rows]
