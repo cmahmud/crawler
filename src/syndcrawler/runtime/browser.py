@@ -43,7 +43,7 @@ class BrowserRenderer:
             return {}
 
         try:
-            from crawlee import ConcurrencySettings
+            from crawlee import ConcurrencySettings, Request
             from crawlee.crawlers import (
                 BasicCrawlingContext,
                 PlaywrightCrawler,
@@ -57,6 +57,14 @@ class BrowserRenderer:
             ) from exc
 
         safe_urls = [await self.egress.validate(url) for url in urls]
+        browser_requests = [
+            Request.from_url(
+                url,
+                unique_key=f"browser:{canonicalize_url(url)}",
+                user_data={"escalated_from": "http"},
+            )
+            for url in safe_urls
+        ]
         records: dict[str, PageRecord] = {}
         proxy_configuration = None
 
@@ -89,7 +97,7 @@ class BrowserRenderer:
             headless=True,
             browser_type=self.config.browser_type,
             browser_launch_options=launch_options or None,
-            max_requests_per_crawl=len(safe_urls),
+            max_requests_per_crawl=len(browser_requests),
             max_request_retries=0,
             concurrency_settings=ConcurrencySettings(
                 min_concurrency=1,
@@ -176,7 +184,7 @@ class BrowserRenderer:
             self.broker.observe(request_key, success=False, quality=0.0)
             context.log.error(f"Browser render failed: {context.request.url}: {error}")
 
-        await crawler.run(safe_urls)
+        await crawler.run(browser_requests)
         return records
 
     async def _safe_links(
