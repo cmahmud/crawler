@@ -42,6 +42,7 @@ class LocalCrawler:
         from crawlee import ConcurrencySettings, Request
         from crawlee.crawlers import BasicCrawlingContext, HttpCrawler, HttpCrawlingContext
         from crawlee.proxy_configuration import ProxyConfiguration
+        from crawlee.storage_clients import MemoryStorageClient
         from pydantic import ValidationError
 
         limit = max_pages or self.config.max_pages
@@ -90,6 +91,7 @@ class LocalCrawler:
             ),
             respect_robots_txt_file=self.config.respect_robots_txt,
             proxy_configuration=proxy_configuration,
+            storage_client=MemoryStorageClient(),
         )
 
         @crawler.pre_navigation_hook
