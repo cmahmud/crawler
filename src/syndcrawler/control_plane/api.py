@@ -11,7 +11,6 @@ from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
 
-from syndcrawler.config import CrawlConfig
 from syndcrawler.runtime.server import (
     CrawlConflictError,
     CrawlNotFoundError,
@@ -19,6 +18,7 @@ from syndcrawler.runtime.server import (
     ServerCrawlStatus,
     ServerRuntime,
 )
+from syndcrawler.runtime.server_env import env_bool, server_runtime_from_env
 
 _bearer = HTTPBearer(auto_error=False)
 
@@ -77,7 +77,7 @@ def create_app(
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         owns_runtime = injected_runtime is None
         if injected_runtime is None:
-            app.state.runtime = await _runtime_from_env()
+            app.state.runtime = await server_runtime_from_env()
         else:
             app.state.runtime = injected_runtime
         try:
@@ -206,31 +206,11 @@ def create_app(
 
 def create_app_from_env() -> FastAPI:
     token = os.environ.get("SYNCRAWLER_API_TOKEN")
-    allow_unauthenticated = _env_bool("SYNCRAWLER_ALLOW_UNAUTHENTICATED_API", False)
+    allow_unauthenticated = env_bool("SYNCRAWLER_ALLOW_UNAUTHENTICATED_API", False)
     return create_app(
         None,
         api_token=token,
         allow_unauthenticated=allow_unauthenticated,
-    )
-
-
-async def _runtime_from_env() -> ServerRuntime:
-    redis_url = _required_env("SYNCRAWLER_REDIS_URL")
-    postgres_dsn = _required_env("SYNCRAWLER_POSTGRES_DSN")
-    config = CrawlConfig(
-        max_pages=_env_int("SYNCRAWLER_MAX_PAGES", 100, minimum=1),
-        max_concurrency=_env_int("SYNCRAWLER_MAX_CONCURRENCY", 10, minimum=1),
-        max_retries=_env_int("SYNCRAWLER_MAX_RETRIES", 2, minimum=0),
-        respect_robots_txt=_env_bool("SYNCRAWLER_RESPECT_ROBOTS", True),
-        allow_private_networks=_env_bool("SYNCRAWLER_ALLOW_PRIVATE_NETWORKS", False),
-        sitemap_discovery_enabled=_env_bool("SYNCRAWLER_SITEMAP_DISCOVERY", True),
-        browser_enabled=_env_bool("SYNCRAWLER_BROWSER_ENABLED", False),
-    )
-    return await ServerRuntime.from_urls(
-        redis_url=redis_url,
-        postgres_dsn=postgres_dsn,
-        config=config,
-        redis_key_prefix=os.environ.get("SYNCRAWLER_REDIS_KEY_PREFIX", "syndcrawler"),
     )
 
 
@@ -239,35 +219,3 @@ def _runtime(request: Request) -> ServerRuntime:
     if runtime is None:
         raise HTTPException(status_code=503, detail="server runtime is not initialized")
     return runtime
-
-
-def _required_env(name: str) -> str:
-    value = os.environ.get(name)
-    if not value:
-        raise RuntimeError(f"missing required environment variable: {name}")
-    return value
-
-
-def _env_bool(name: str, default: bool) -> bool:
-    value = os.environ.get(name)
-    if value is None:
-        return default
-    normalized = value.strip().lower()
-    if normalized in {"1", "true", "yes", "on"}:
-        return True
-    if normalized in {"0", "false", "no", "off"}:
-        return False
-    raise RuntimeError(f"{name} must be a boolean value")
-
-
-def _env_int(name: str, default: int, *, minimum: int) -> int:
-    value = os.environ.get(name)
-    if value is None:
-        return default
-    try:
-        parsed = int(value)
-    except ValueError as exc:
-        raise RuntimeError(f"{name} must be an integer") from exc
-    if parsed < minimum:
-        raise RuntimeError(f"{name} must be >= {minimum}")
-    return parsed
