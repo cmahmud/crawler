@@ -1,0 +1,99 @@
+x-syndcrawler-env: &syndcrawler-env
+  SYNCRAWLER_REDIS_URL: redis://redis:6379/0
+  SYNCRAWLER_POSTGRES_DSN: "host=postgres port=5432 dbname=syndcrawler user=syndcrawler password=${SYNCRAWLER_POSTGRES_PASSWORD:?set SYNCRAWLER_POSTGRES_PASSWORD}"
+  SYNCRAWLER_REDIS_KEY_PREFIX: ${SYNCRAWLER_REDIS_KEY_PREFIX:-syndcrawler}
+  SYNCRAWLER_MAX_PAGES: ${SYNCRAWLER_MAX_PAGES:-100}
+  SYNCRAWLER_MAX_CONCURRENCY: ${SYNCRAWLER_MAX_CONCURRENCY:-10}
+  SYNCRAWLER_MAX_RETRIES: ${SYNCRAWLER_MAX_RETRIES:-2}
+  SYNCRAWLER_RESPECT_ROBOTS: ${SYNCRAWLER_RESPECT_ROBOTS:-true}
+  SYNCRAWLER_ALLOW_PRIVATE_NETWORKS: ${SYNCRAWLER_ALLOW_PRIVATE_NETWORKS:-false}
+  SYNCRAWLER_SITEMAP_DISCOVERY: ${SYNCRAWLER_SITEMAP_DISCOVERY:-true}
+  SYNCRAWLER_BROWSER_ENABLED: ${SYNCRAWLER_BROWSER_ENABLED:-false}
+  SYNCRAWLER_BROWSER_TYPE: ${SYNCRAWLER_BROWSER_TYPE:-chromium}
+  SYNCRAWLER_BROWSER_MAX_CONCURRENCY: ${SYNCRAWLER_BROWSER_MAX_CONCURRENCY:-2}
+  SYNCRAWLER_BROWSER_TIMEOUT_SECONDS: ${SYNCRAWLER_BROWSER_TIMEOUT_SECONDS:-45}
+  SYNCRAWLER_BROWSER_SETTLE_SECONDS: ${SYNCRAWLER_BROWSER_SETTLE_SECONDS:-0.25}
+  SYNCRAWLER_BROWSER_CHROMIUM_SANDBOX: ${SYNCRAWLER_BROWSER_CHROMIUM_SANDBOX:-true}
+  SYNCRAWLER_POSTGRES_POOL_MIN: ${SYNCRAWLER_POSTGRES_POOL_MIN:-1}
+  SYNCRAWLER_POSTGRES_POOL_MAX: ${SYNCRAWLER_POSTGRES_POOL_MAX:-10}
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: syndcrawler
+      POSTGRES_USER: syndcrawler
+      POSTGRES_PASSWORD: ${SYNCRAWLER_POSTGRES_PASSWORD:?set SYNCRAWLER_POSTGRES_PASSWORD}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U syndcrawler -d syndcrawler"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 3s
+
+  api:
+    build: .
+    image: syndcrawler:local
+    restart: unless-stopped
+    init: true
+    command: ["syndcrawler", "serve", "--host", "0.0.0.0", "--port", "8080"]
+    environment:
+      <<: *syndcrawler-env
+      SYNCRAWLER_API_TOKEN: ${SYNCRAWLER_API_TOKEN:?set SYNCRAWLER_API_TOKEN}
+      SYNCRAWLER_ALLOW_UNAUTHENTICATED_API: "false"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "${SYNCRAWLER_API_BIND:-127.0.0.1}:${SYNCRAWLER_API_PORT:-8080}:8080"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=3).read()",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  worker:
+    build: .
+    image: syndcrawler:local
+    restart: unless-stopped
+    init: true
+    shm_size: 1gb
+    command: ["syndcrawler", "worker"]
+    environment:
+      <<: *syndcrawler-env
+      SYNCRAWLER_WORKER_POLL_INTERVAL: ${SYNCRAWLER_WORKER_POLL_INTERVAL:-1}
+      SYNCRAWLER_WORKER_ERROR_BACKOFF: ${SYNCRAWLER_WORKER_ERROR_BACKOFF:-5}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+volumes:
+  postgres-data:
+  redis-data:
