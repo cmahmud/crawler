@@ -47,7 +47,11 @@ def test_inline_document_write_shell_requests_browser() -> None:
           <script>
             var data = [{"text": "A quote", "author": {"name": "Author"}}];
             for (var i in data) {
-              document.write('<div class="quote"><span class="text">' + data[i].text + '</span></div>');
+              document.write(
+                '<div class="quote"><span class="text">'
+                + data[i].text
+                + '</span></div>'
+              );
             }
           </script>
         </body></html>
